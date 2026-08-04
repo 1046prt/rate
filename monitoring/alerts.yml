@@ -1,0 +1,58 @@
+# Prometheus alert rules for the rate limiter. Backs the SLOs documented in README ("SLOs & Alerting").
+groups:
+  - name: rate-limiter-availability
+    rules:
+      - alert: RateLimiterDown
+        expr: up{job="rate-limiter"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Rate limiter API is unreachable"
+
+      - alert: RedisCircuitBreakerOpen
+        expr: resilience4j_circuitbreaker_state{name="redis", state="open"} == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis circuit breaker is OPEN - rate limiting is failing open (requests allowed unthrottled)"
+
+      - alert: RedisFailingOpen
+        expr: increase(ratelimiter_redis_fallback_total[2m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis calls are failing - rate limiter is failing open"
+
+  - name: rate-limiter-errors
+    rules:
+      - alert: HighThrottleRate
+        expr: |
+          sum(rate(ratelimiter_requests_rejected_total[5m]))
+            / sum(rate(ratelimiter_requests_total[5m])) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 50% of requests are being throttled (HTTP 429) - limit configuration may be too tight or a client is misbehaving"
+
+      - alert: HighApiKeyFailures
+        expr: increase(ratelimiter_auth_invalid_api_key_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sustained invalid API key attempts - possible credential stuffing"
+
+  - name: rate-limiter-latency
+    rules:
+      - alert: HighLatencyP99
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(http_server_requests_seconds_bucket[5m])) by (le)) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p99 latency exceeds 1s"

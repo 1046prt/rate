@@ -1,0 +1,13 @@
+# Minimal Alertmanager config: route everything to a placeholder webhook.
+# Replace the webhook_configs URL with your own receiver (Slack, PagerDuty, Opsgenie, ...).
+route:
+  group_by: ["alertname", "severity"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  receiver: default
+
+receivers:
+  - name: default
+    webhook_configs:
+      - url: "http://placeholder-receiver:8080/hooks"

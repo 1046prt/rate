@@ -1,0 +1,15 @@
+server:
+  ssl:
+    key-store: classpath:keystore.p12
+    key-store-password: changeit
+    key-store-type: PKCS12
+    enabled: true
+
+spring:
+  profiles: dev
+
+# Optionally you can set the default limits for dev profile here
+ratelimiter:
+  apiKey: ''
+  defaultLimit: 100
+  defaultWindowSec: 60

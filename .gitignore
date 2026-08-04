@@ -1,0 +1,16 @@
+target/
+.env
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Local infra state (Caddy/Redis data dirs, if any)
+caddy/data/
+caddy/config/
+
+# NOTE: keystore.p12 stays committed ON PURPOSE - it is a self-signed dev-only
+# certificate for the dev profile. Regenerate it and keep the real password in
+# your secret store (see README "TLS").

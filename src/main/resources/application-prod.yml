@@ -1,0 +1,27 @@
+server:
+  ssl:
+    key-store: classpath:keystore.p12
+    # No default: production refuses to start without the secret (inject via
+    # your secret store, e.g. Docker secrets / K8s secret, never a repo value).
+    key-store-password: ${KEYSTORE_PASSWORD}
+    key-store-type: PKCS12
+    enabled: true
+
+spring:
+  profiles: prod
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
+ratelimiter:
+  apiKey: ${RATELIMITER_API_KEY:}
+  defaultLimit: ${RATELIMITER_DEFAULT_LIMIT:200}
+  defaultWindowSec: ${RATELIMITER_DEFAULT_WINDOW_SEC:30}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+  endpoint:
+    health:
+      show-details: never

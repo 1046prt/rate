@@ -1,0 +1,54 @@
+spring:
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      # Optional Redis AUTH password; leave blank for no authentication
+      password: ${REDIS_PASSWORD:}
+      # Bound on every Redis command - keep it short, the API depends on it
+      timeout: 500ms
+      # Optional TLS to Redis; enable with REDIS_SSL=true or spring.data.redis.ssl.enabled=true
+      ssl:
+        enabled: ${REDIS_SSL:false}
+
+ratelimiter:
+  apiKey: ''
+  limits:
+    # example: clientId -> maxRequests
+    default: 100
+  windows:
+    # example: clientId -> windowSizeSec (use duration units, e.g. 60s, PT1M)
+    default: 60s
+
+# If Redis goes down or the circuit opens, the rate limiter fails OPEN:
+# requests are allowed (never 500) and the outage is visible via
+# ratelimiter.redis.fallback and the breaker's own metrics.
+resilience4j:
+  circuitbreaker:
+    # Breaker metrics are bound explicitly in RedisGuard; disable the auto-config publisher
+    # so meters are registered exactly once and visible even before the first event.
+    metrics:
+      enabled: false
+    configs:
+      default:
+        slidingWindowSize: 10
+        failureRateThreshold: 50
+        waitDurationInOpenState: 30s
+        permittedNumberOfCallsInHalfOpenState: 3
+    instances:
+      redis:
+        baseConfig: default
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    distribution:
+      # Enable histogram buckets for HTTP latency so p99/p95 alerts are meaningful
+      percentiles-histogram:
+        http.server.requests: true

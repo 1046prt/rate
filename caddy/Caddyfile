@@ -1,0 +1,8 @@
+# TLS termination at the edge (recommended production pattern).
+# For a real domain, set TLS_DOMAIN (e.g. TLS_DOMAIN=api.example.com) and remove
+# `tls internal` so Caddy obtains a Let's Encrypt certificate automatically.
+# Without a domain, Caddy serves localhost with an internally-issued certificate.
+{$TLS_DOMAIN:localhost} {
+	tls internal
+	reverse_proxy app:8080
+}

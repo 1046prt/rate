@@ -1,0 +1,280 @@
+# Rate Limiter Service
+
+A **Spring Boot** (Java 21) micro-service that provides rate-limiting as a service (RLaaS). It implements five classic algorithms with **Redis** for distributed state, using atomic Lua scripts so concurrent requests are safe. Built to survive Redis outages: every Redis call runs behind a circuit breaker with a fail-open policy (see [Resilience](#resilience)). Includes optional API-key auth, TLS profiles, Prometheus metrics, and Testcontainers integration tests.
+
+## Features
+
+- Five algorithms: Fixed Window, Sliding Window Log, Sliding Window Counter, Token Bucket, Leaky Bucket — see [Algorithms](#algorithms) for the exact semantics.
+- Configurable limits and windows per algorithm via `application.yml` or environment variables.
+- **Resilient to Redis outages**: circuit breaker + 500 ms command timeout + fail-open (never 500s), with dedicated failure metrics.
+- Optional API-key authentication (`X-Api-Key` header); published Docker config fails closed, see [Authentication](#authentication).
+- Micrometer metrics with a Prometheus exporter.
+- TLS profiles (`dev`/`prod`) using an embedded PKCS12 keystore.
+- Swagger UI at `/swagger-ui.html`.
+- Docker Compose bringing up the app + Redis with healthchecks (optional Redis AUTH password).
+- Testcontainers-based integration tests, including a Redis-down fail-open test (require a running Docker daemon).
+- GitHub Actions CI: full `mvn clean verify` (tests included) + Docker image build.
+
+## Build & Run
+
+Requires Java 21 and Maven. Redis is needed at runtime — either a local one (`SPRING_DATA_REDIS_HOST`/`SPRING_DATA_REDIS_PORT`) or the compose container.
+
+### Maven
+
+```bash
+mvn clean package              # builds the jar (skips tests)
+java -jar target/rate-limiter-service-0.0.1-SNAPSHOT.jar
+# reachable at http://localhost:8080, Redis at localhost:6379
+```
+
+Run the full test suite (starts Redis via Testcontainers, so Docker must be running):
+
+```bash
+mvn clean verify
+```
+
+### Docker Compose
+
+```bash
+cp .env.example .env           # then set a strong RATELIMITER_API_KEY
+docker compose up --build      # starts the app (8080) and a Redis container
+```
+
+The app refuses to start under compose unless `RATELIMITER_API_KEY` is set — this is deliberate, see [Authentication](#authentication). Optionally set `REDIS_PASSWORD` in `.env` to start Redis with `--requirepass` (the app authenticates automatically).
+
+### TLS (dev / prod profiles)
+
+**Recommended: terminate TLS at the edge proxy** (the app stays plain HTTP on the internal network):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d --build
+# https://localhost (Caddy issues an internal cert; for a real domain set
+# TLS_DOMAIN in .env and remove `tls internal` from caddy/Caddyfile for
+# automatic Let's Encrypt certificates)
+```
+
+Alternatively the app can serve TLS itself via the `dev`/`prod` profiles, using `src/main/resources/keystore.p12`. It is checked in for development convenience only — regenerate it for any real deployment and keep the password in a secret store:
+
+```bash
+keytool -genkeypair -alias ratelimiter -keyalg RSA -keysize 2048 -validity 3650 \
+  -storetype PKCS12 -keystore src/main/resources/keystore.p12 \
+  -storepass changeit -keypass changeit \
+  -dname "CN=localhost, OU=Rate Limiter, O=Example, C=US"
+```
+
+```bash
+java -jar target/rate-limiter-service-0.0.1-SNAPSHOT.jar --spring.profiles.active=dev
+# HTTPS on port 8080 (keystore password `changeit`)
+```
+
+The `prod` profile refuses to start without `KEYSTORE_PASSWORD` (no fallback) — inject it from your secret store (Docker secrets / K8s secret / vault), never from the repo. Health details are hidden in `prod` and only `health,metrics,prometheus` are exposed.
+
+## Authentication
+
+Auth is optional at the application level and controlled by `ratelimiter.apiKey` (env: `RATELIMITER_API_KEY`):
+
+- **Empty / unset** — open access. Every request on `/api/v1/**` is authenticated as a generic API client.
+- **Set** — every request to `/api/v1/**` must send the value in the `X-Api-Key` header; otherwise a 401 `{"error":"Invalid API key"}` is returned. Invalid attempts increment the `ratelimiter_auth_invalid_api_key_total` counter.
+
+Actuator health/prometheus endpoints and Swagger remain public in both modes.
+
+> **Compose default (fail-closed):** `docker-compose.yml` requires `RATELIMITER_API_KEY` from your environment (`.env`) and errors out if it is missing, so a fresh clone can never silently run with authentication disabled. Run `openssl rand -hex 32` to generate a key. Local Maven runs remain open by default (`apiKey: ''` in `application.yml`).
+
+## API
+
+### Check rate limit
+
+`POST /api/v1/check`
+
+```json
+{
+  "clientId": "user123",
+  "algorithm": "FIXED"
+}
+```
+
+`clientId` is required; `algorithm` is one of `FIXED`, `SLIDING_LOG`, `SLIDING_COUNTER`, `TOKEN_BUCKET`, `LEAKY_BUCKET` (case-insensitive).
+
+**200 – allowed**
+
+```json
+{ "allowed": true, "message": "Request allowed" }
+```
+
+**429 – rejected** (plus the same rate-limit headers as a 200)
+
+```json
+{ "allowed": false, "message": "Rate limit exceeded for client user123" }
+```
+
+**400** – missing/invalid `clientId` or `algorithm`, or an unknown algorithm name.
+
+Response headers on both 200 and 429:
+
+- `X-RateLimit-Limit` – configured limit for the algorithm.
+- `X-RateLimit-Remaining` – remaining requests in the current window (200 only; estimated for `SLIDING_COUNTER`, drained water for `LEAKY_BUCKET`).
+- `Retry-After` – seconds until the window resets (429 only).
+- `X-Request-Id` – unique correlation id generated per request.
+
+## Algorithms
+
+All state transitions run atomically in Redis Lua scripts; no `INCR`-without-`EXPIRE` races.
+
+| Algorithm | Exact? | Semantics |
+|---|---|---|
+| `FIXED` | yes | Per-client counter, atomic `INCR`+`EXPIRE`; resets at each window boundary. |
+| `SLIDING_LOG` | yes | Redis sorted set of request timestamps; expired entries are trimmed, then the window count is checked and the request appended — all in one script. |
+| `SLIDING_COUNTER` | approximate | Weights the previous window's counter by how much of the current window has elapsed: `estimated = prevCount × (1 − elapsed/window) + currentCount`. |
+| `TOKEN_BUCKET` | yes | Bucket holds up to `limit` tokens and refills by the full capacity each window (lazy refill on access); a request consumes one token. |
+| `LEAKY_BUCKET` | yes | **Water-level model (not a queue):** water leaks out of the bucket at one unit per window, and a request is only allowed while `water < capacity`. When the bucket is full, requests are rejected until a leak period elapses. |
+
+Note the leaky-bucket rewrite: it tracks how much in-flight "water" has drained over time rather than buffering a FIFO queue of requests — rejection happens immediately when the bucket is full, there is no waiting queue.
+
+## Resilience
+
+The rate limiter must not become a hard dependency of your API. Every Redis operation is guarded by a `RedisGuard` (Resilience4j circuit breaker + the 500 ms Lettuce command timeout from `spring.data.redis.timeout`):
+
+- **Circuit open / Redis down / command timeout** → the limiter **fails open**: the request is allowed and logged, the breaker records the failure, and `ratelimiter.redis.fallback` is incremented. The API stays up during a Redis outage instead of returning 500s.
+- **Recovery** — after `waitDurationInOpenState` (default 30 s) the breaker probes Redis in half-open state and closes again once calls succeed.
+- **Tunable** via the `resilience4j.circuitbreaker.instances.redis.*` block in `application.yml` (sliding window size, failure-rate threshold, open-state duration).
+- Alert on `ratelimiter_redis_fallback_total` (or the breaker's own `resilience4j_circuitbreaker_*` metrics) to detect limiter degradation.
+
+> **Trade-off:** fail-open means clients can exceed their limit while Redis is down. That is the deliberate choice — availability over strict rate limiting. If you need fail-closed instead, treat a `null` guard result in the limiters as "reject".
+
+## Configuration
+
+Base config in `src/main/resources/application.yml` (profile overrides in `application-dev.yml` / `application-prod.yml`):
+
+```yaml
+spring:
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      password: ${REDIS_PASSWORD:}   # optional Redis AUTH
+      timeout: 500ms                  # bound on every Redis command
+      ssl:
+        enabled: ${REDIS_SSL:false}   # optional TLS to Redis
+
+ratelimiter:
+  apiKey: ''            # optional; see Authentication
+  limits:
+    default: 100        # per-algorithm overrides possible, e.g. TOKEN_BUCKET: 50
+  windows:
+    default: 60s        # per-algorithm overrides, e.g. SLIDING_LOG: PT2M
+```
+
+> **Gotcha:** durations must use ISO-8601/Spring units (`60s`, `PT1M`, `2h`). A bare number (`60`) is interpreted as **milliseconds**, not seconds.
+
+Available environment variable overrides:
+
+| Variable | Meaning |
+|---|---|
+| `SPRING_DATA_REDIS_HOST`, `SPRING_DATA_REDIS_PORT` | Redis connection (default `localhost:6379`) |
+| `REDIS_PASSWORD` | Redis AUTH password; blank = no auth |
+| `REDIS_SSL` | `true` to use TLS to Redis |
+| `RATELIMITER_API_KEY` | API key required on `/api/v1/**`; blank = open access |
+| `RATELIMITER_DEFAULT_LIMIT` | Default per-client limit (prod default 200) |
+| `RATELIMITER_DEFAULT_WINDOW_SEC` | Default window in seconds (prod default 30) |
+| `KEYSTORE_PASSWORD` | Keystore password for the `prod` profile |
+
+### Redis production hardening
+
+- **AUTH/ACL**: set `REDIS_PASSWORD` (or `SPRING_DATA_REDIS_USERNAME`/`SPRING_DATA_REDIS_PASSWORD` for ACL users). Compose applies `--requirepass` automatically when set.
+- **TLS**: `REDIS_SSL=true` (and the standard `SPRING_DATA_REDIS_SSL_*` properties) for encrypted transport.
+- **High availability**: run the Sentinel topology (master + replica + Sentinel) with the additive compose file:
+  ```bash
+  docker compose -f docker-compose.yml -f docker-compose.redis-ha.yml up -d --build
+  ```
+  The app connects via `SPRING_DATA_REDIS_SENTINEL_MASTER`/`SPRING_DATA_REDIS_SENTINEL_NODES`; failover is automatic and was live-tested (killed master → replica promoted in ~15 s → app kept serving, limits kept enforcing, old master rejoined as replica on restart). Sentinel must monitor the master by **static IP or stable VIP, never a hostname** — a stopped container's DNS name disappears and breaks the failover.
+- **State across failover**: with a warm replica (as in this topology), rate-limit state survives failover because the promoted node holds replicated data — limits keep enforcing seamlessly. State resets only if the new primary comes up cold (e.g., full cluster loss). Either way limits re-learn instantly; both behaviors are acceptable, just be aware of which one you get.
+- **Persistence**: compose Redis uses defaults (RDB snapshots). Enable AOF (`--appendonly yes`) if you want limits to survive Redis restarts.
+
+## Monitoring & Alerting
+
+Run Prometheus + Alertmanager alongside the stack:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
+# Prometheus: http://localhost:9090 (alerts at /alerts), Alertmanager: http://localhost:9093
+```
+
+`monitoring/alerts.yml` ships six rules (validated against the live deployment):
+
+| Alert | Condition | Severity |
+|---|---|---|
+| `RateLimiterDown` | `up == 0` for 1m | critical |
+| `RedisCircuitBreakerOpen` | breaker `redis` open for 1m | critical |
+| `RedisFailingOpen` | `ratelimiter_redis_fallback_total` increasing | warning |
+| `HighThrottleRate` | >50% of requests are 429 for 5m | warning |
+| `HighApiKeyFailures` | sustained bad API keys (credential stuffing) | warning |
+| `HighLatencyP99` | p99 `http_server_requests_seconds` > 1s for 5m | warning |
+
+`monitoring/alertmanager.yml` is a placeholder — point the webhook at your receiver (Slack/PagerDuty/Opsgenie).
+
+## SLOs (defaults)
+
+| SLO | Definition | Backing alert |
+|---|---|---|
+| Availability | 99.9% of `/api/v1/check` calls succeed (non-5xx) | `RateLimiterDown`, `RedisCircuitBreakerOpen` |
+| Latency | p95 < 50 ms, p99 < 1 s | `HighLatencyP99` |
+| Correctness | no 5xx due to limiter failure; fail-open only during Redis outages | `RedisFailingOpen` |
+| Error budget | 429s count toward availability error budget; track `ratelimiter_requests_rejected_total / total` | `HighThrottleRate` |
+
+## Load testing
+
+- **JUnit soak** (excluded from the default run so CI stays fast):
+  ```bash
+  mvn test -Dtest=SoakTest "-Dexcluded.test.groups="
+  # prints e.g. "SOAK: 13027 calls in PT10S (1303 req/s), 0 failures"
+  ```
+- **k6** (for sustained production-scale runs — not bundled, install from k6.io):
+  ```bash
+  k6 run --env API_KEY=... --vus 100 --duration 2m loadtest/check.js
+  ```
+  Fails (exit ≠ 0) if error rate ≥ 0.1%, p95 ≥ 50 ms, or checks fail.
+
+## Metrics
+
+Prometheus endpoint: `http://localhost:8080/actuator/prometheus` (also `health`, `info`, `metrics`).
+
+| Metric | Meaning |
+|---|---|
+| `ratelimiter_requests_total` | All requests to `/api/v1/check` |
+| `ratelimiter_requests_allowed` | Requests allowed by the limiter |
+| `ratelimiter_requests_rejected` | Requests rejected (HTTP 429) |
+| `ratelimiter_algorithm_calls_total{algorithm="FIXED"}` | Calls per algorithm |
+| `ratelimiter_auth_invalid_api_key_total` | Requests rejected by API-key auth (401) |
+| `ratelimiter_redis_fallback_total` | Redis calls that failed and were allowed through (fail-open) — **alert on this** |
+| `resilience4j_circuitbreaker_*` | Circuit-breaker state (`state` gauge, calls, failure rate) for the `redis` breaker |
+
+Health details are always shown in the default profile; the `prod` profile hides them.
+
+## Testing
+
+```bash
+mvn test        # 34 tests: unit + concurrency tests for all 5 algorithms, resilience tests,
+                # Redis-down fail-open test, controller e2e
+mvn verify      # full build including tests (Docker required for Testcontainers)
+```
+
+## CI
+
+`.github/workflows/ci.yml` runs on every push/PR:
+
+1. JDK 21 + Maven setup (cached dependencies).
+2. `mvn --batch-mode clean verify` — Testcontainers uses the runner's Docker daemon.
+3. `docker build` to prove the Dockerfile is healthy.
+
+## Logging
+
+Logback config (`logback-spring.xml`) logs **structured JSON** to the console with MDC context (including the `X-Request-Id` correlation id). Ship it to any JSON log collector as-is.
+
+## Stack notes
+
+- **Spring Boot 3.5.x** (supported line) on Java 21, Spring Data Redis (Lettuce), Resilience4j 2.x, Micrometer, Testcontainers.
+- Boot 4.x is the next major line; the app deliberately pins the current 3.x line — plan a migration when convenient, nothing in this codebase depends on Boot-3-specific internals beyond standard auto-configuration.
+
+## License
+
+MIT

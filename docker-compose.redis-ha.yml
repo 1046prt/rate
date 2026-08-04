@@ -1,0 +1,54 @@
+# Redis high-availability profile: master + replica + Sentinel with automatic failover.
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.redis-ha.yml up -d --build
+#
+# The app connects through Sentinel (spring.data.redis.sentinel.*) instead of a single host.
+# The Sentinel monitors the master by STATIC IP: monitoring by hostname breaks during failover
+# because a stopped container's DNS name disappears (same applies in real infra - monitor by IP
+# or a stable VIP, never a name that goes away with the node).
+#
+# NOTE: rate-limit state lives on the Redis primary; after a failover the new primary starts
+# with fresh state, so per-client windows reset. That is acceptable for rate limiting (limits
+# re-learn instantly) but verify it matches your requirements before relying on it.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+services:
+  app:
+    environment:
+      SPRING_DATA_REDIS_SENTINEL_MASTER: mymaster
+      SPRING_DATA_REDIS_SENTINEL_NODES: sentinel:26379
+
+  redis:
+    networks:
+      default:
+        ipv4_address: 172.28.0.10
+
+  redis-replica:
+    image: redis:7-alpine
+    command: ["sh", "-c", "until redis-cli -h redis ping >/dev/null 2>&1; do sleep 1; done; exec redis-server --appendonly yes --replicaof redis 6379"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "-h", "redis", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  sentinel:
+    image: redis:7-alpine
+    command: ["sh", "-c", "printf 'port 26379\\nsentinel monitor mymaster 172.28.0.10 6379 1\\nsentinel down-after-milliseconds mymaster 5000\\nsentinel failover-timeout mymaster 10000\\nsentinel parallel-syncs mymaster 1\\n' > /tmp/sentinel.conf && exec redis-sentinel /tmp/sentinel.conf"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -h 127.0.0.1 -p 26379 sentinel get-master-addr-by-name mymaster | head -1 | grep -q ."]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
