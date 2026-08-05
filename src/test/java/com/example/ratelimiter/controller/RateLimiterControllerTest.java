@@ -81,6 +81,16 @@ public class RateLimiterControllerTest {
         assertTrue(post("userB", "FIXED").getStatusCode().is2xxSuccessful());
     }
 
+    @Test
+    void rejectsMalformedJsonWith400() {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        HttpEntity<String> malformed = new HttpEntity<>("{invalid json", headers);
+        ResponseEntity<CheckResponseDto> response =
+                restTemplate.postForEntity("/api/v1/check", malformed, CheckResponseDto.class);
+        assertEquals(HttpStatus.BAD_REQUEST, response.getStatusCode());
+    }
+
     private ResponseEntity<CheckResponseDto> post(String clientId, String algorithm) {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
