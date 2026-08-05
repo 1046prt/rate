@@ -1,0 +1,55 @@
+# Production Sentinel quorum profile: 3 sentinels, quorum 2.
+# Run WITH docker-compose.redis-ha.yml (never alone):
+#   docker compose -f docker-compose.yml -f docker-compose.redis-ha.yml -f docker-compose.sentinel-ha.yml up -d
+#
+# Turns the single dev sentinel into a 3-node quorum (quorum 2) so a failover is
+# decided by a majority of independent sentinel processes, not one. The base
+# "sentinel" service keeps its name (container rate-sentinel-1) and is joined by
+# sentinel-2 / sentinel-3; the app learns all three nodes so losing one sentinel
+# never breaks topology discovery. All sentinels share the entrypoint script
+# monitoring/sentinel-entrypoint.sh (mounted read-only).
+services:
+  app:
+    environment:
+      SPRING_DATA_REDIS_SENTINEL_NODES: sentinel:26379,sentinel-2:26379,sentinel-3:26379
+
+  sentinel:
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - SENTINEL_QUORUM=2
+
+  sentinel-2:
+    image: redis:7-alpine
+    command: ["sh", "/sentinel-entrypoint.sh"]
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - SENTINEL_QUORUM=2
+    volumes:
+      - ./monitoring/sentinel-entrypoint.sh:/sentinel-entrypoint.sh:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -h 127.0.0.1 -p 26379 sentinel get-master-addr-by-name mymaster | head -1 | grep -q ."]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  sentinel-3:
+    image: redis:7-alpine
+    command: ["sh", "/sentinel-entrypoint.sh"]
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - SENTINEL_QUORUM=2
+    volumes:
+      - ./monitoring/sentinel-entrypoint.sh:/sentinel-entrypoint.sh:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -h 127.0.0.1 -p 26379 sentinel get-master-addr-by-name mymaster | head -1 | grep -q ."]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped

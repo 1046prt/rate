@@ -51,6 +51,13 @@ For the high-availability Redis topology (master + replica + Sentinel) and the o
 docker compose -f docker-compose.yml -f docker-compose.redis-ha.yml -f docker-compose.monitoring.yml up -d --build
 ```
 
+For a **production Sentinel quorum** (3 sentinels, quorum 2 — failover decided by a majority, not one process) add `docker-compose.sentinel-ha.yml`. The app learns all three sentinel nodes, so losing any one never breaks topology discovery:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.redis-ha.yml \
+  -f docker-compose.sentinel-ha.yml -f docker-compose.monitoring.yml up -d
+```
+
 ### TLS (dev / prod profiles)
 
 **Recommended: terminate TLS at the edge proxy** (the app stays plain HTTP on the internal network):
@@ -63,7 +70,7 @@ docker compose -f docker-compose.yml -f docker-compose.redis-ha.yml \
 # automatic Let's Encrypt certificates)
 ```
 
-The TLS overlay was smoke-tested: HTTPS serves through Caddy, the app publishes **no host port** in this mode (edge-only exposure), and Caddy round-robins between scaled replicas (kill a replica and traffic continues on the survivor). In TLS mode the app is NOT reachable on `http://localhost:8080` — use `https://localhost`.
+The TLS overlay is load-tested (see [Load testing](#load-testing)) and fails over: HTTPS serves through Caddy, the app publishes **no host port** in this mode (edge-only exposure), and Caddy round-robins between scaled replicas (kill a replica and traffic continues on the survivor). In TLS mode the app is NOT reachable on `http://localhost:8080` — use `https://localhost`.
 
 Alternatively the app can serve TLS itself via the `dev`/`prod` profiles, using `src/main/resources/keystore.p12`. It is checked in for development convenience only — regenerate it for any real deployment and keep the password in a secret store:
 
@@ -260,11 +267,26 @@ Full operational procedures (alert-by-alert responses, failover drill, backup/re
   mvn test -Dtest=SoakTest "-Dexcluded.test.groups="
   # prints e.g. "SOAK: 13027 calls in PT10S (1303 req/s), 0 failures"
   ```
-- **k6** (for sustained production-scale runs — not bundled, install from k6.io):
+- **k6** (for sustained production-scale runs — not bundled, install from k6.io, or use the Docker image):
   ```bash
   k6 run --env API_KEY=... --vus 100 --duration 2m loadtest/check.js
+  # or, against the TLS edge from inside the compose network:
+  docker run --rm --network rate_default \
+    -v "$PWD/loadtest:/loadtest" -e API_KEY=... -e BASE_URL=https://localhost \
+    -e K6_INSECURE_SKIP_TLS_VERIFY=true grafana/k6 run /loadtest/check.js
   ```
-  Fails (exit ≠ 0) if error rate ≥ 0.1%, p95 ≥ 50 ms, or checks fail.
+  Fails (exit ≠ 0) if the **5xx rate ≥ 0.1%**, p95 ≥ 100 ms (edge), or checks fail. 429 responses are expected (the limiter doing its job) and are reported separately as `http_429`.
+
+**Measured on the production shape** (TLS edge → 2 app replicas → 3-sentinel Redis HA, 100 VUs ramping, 2 min):
+
+| Metric | Result |
+|---|---|
+| Throughput | ~2,400 req/s (290k requests in 2 min) |
+| Server errors (5xx) | **0.00%** (k6 and Prometheus agree) |
+| p95 latency | 44.9 ms at the edge (k6), 13.5 ms in-app (Prometheus) |
+| Throttle ratio | 95.2% (deliberate — per-client windows far below load; k6 and Prometheus agree) |
+| Replica balance | ~50/50 across both app instances (Prometheus per-instance rates) |
+| Redis fail-open | 0 (`ratelimiter_redis_fallback_total` stayed 0 for the whole run) |
 
 ## Metrics
 
@@ -299,6 +321,7 @@ mvn verify      # full build including tests (Docker required for Testcontainers
 3. `docker build` to prove the Dockerfile is healthy.
 4. **Trivy scan** of the built image (fails on unfixed HIGH/CRITICAL) — the scan found and blocked CVE-2026-59901 (netty-codec) and base-image Alpine CVEs during development; the Dockerfile now pins the netty fix and runs `apk upgrade` at build time.
 5. **CycloneDX SBOM** generated from the image and uploaded as a CI artifact.
+6. On push to `main`, **publish to GHCR** as `ghcr.io/<owner>/rate-limiter-service:<sha>` + `:latest` (needs the repo's `packages: write` permission, granted automatically to `GITHUB_TOKEN`).
 
 Dependabot (`.github/dependabot.yml`) opens weekly PRs for Maven, GitHub Actions and Docker image updates.
 

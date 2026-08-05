@@ -2,6 +2,9 @@
 # Usage:
 #   docker compose -f docker-compose.yml -f docker-compose.redis-ha.yml up -d --build
 #
+# For a full production sentinel quorum (3 sentinels, quorum 2) add:
+#   -f docker-compose.sentinel-ha.yml
+#
 # The app connects through Sentinel (spring.data.redis.sentinel.*) instead of a single host.
 # The Sentinel monitors the master by STATIC IP: monitoring by hostname breaks during failover
 # because a stopped container's DNS name disappears (same applies in real infra - monitor by IP
@@ -47,9 +50,12 @@ services:
 
   sentinel:
     image: redis:7-alpine
-    command: ["sh", "-c", "printf 'port 26379\\nsentinel monitor mymaster 172.28.0.10 6379 1\\nsentinel down-after-milliseconds mymaster 5000\\nsentinel failover-timeout mymaster 10000\\nsentinel parallel-syncs mymaster 1\\n' > /tmp/sentinel.conf; if [ -n \"$$REDIS_PASSWORD\" ]; then printf 'sentinel auth-pass mymaster %s\\n' \"$$REDIS_PASSWORD\" >> /tmp/sentinel.conf; fi; exec redis-sentinel /tmp/sentinel.conf"]
+    command: ["sh", "/sentinel-entrypoint.sh"]
     environment:
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - SENTINEL_QUORUM=${SENTINEL_QUORUM:-1}
+    volumes:
+      - ./monitoring/sentinel-entrypoint.sh:/sentinel-entrypoint.sh:ro
     depends_on:
       redis:
         condition: service_healthy
