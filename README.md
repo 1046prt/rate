@@ -42,6 +42,12 @@ docker compose up --build      # starts the app (8080) and a Redis container
 
 The app refuses to start under compose unless `RATELIMITER_API_KEY` is set — this is deliberate, see [Authentication](#authentication). Optionally set `REDIS_PASSWORD` in `.env` to start Redis with `--requirepass` (the app authenticates automatically).
 
+For the high-availability Redis topology (master + replica + Sentinel) and the observability stack, always pass the **full compose file set** so Compose reconciles every container:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.redis-ha.yml -f docker-compose.monitoring.yml up -d --build
+```
+
 ### TLS (dev / prod profiles)
 
 **Recommended: terminate TLS at the edge proxy** (the app stays plain HTTP on the internal network):
@@ -95,7 +101,6 @@ Actuator health/prometheus endpoints and Swagger remain public in both modes.
 
 `clientId` is required; `algorithm` is one of `FIXED`, `SLIDING_LOG`, `SLIDING_COUNTER`, `TOKEN_BUCKET`, `LEAKY_BUCKET` (case-insensitive).
 
-**200 – allowed**
 
 ```json
 { "allowed": true, "message": "Request allowed" }
@@ -177,10 +182,12 @@ Available environment variable overrides:
 | `RATELIMITER_DEFAULT_LIMIT` | Default per-client limit (prod default 200) |
 | `RATELIMITER_DEFAULT_WINDOW_SEC` | Default window in seconds (prod default 30) |
 | `KEYSTORE_PASSWORD` | Keystore password for the `prod` profile |
+| `RECEIVER_URL` | Alertmanager webhook receiver URL (rendered into its config at start) |
+| `GRAFANA_ADMIN_USER`, `GRAFANA_ADMIN_PASSWORD` | Grafana admin credentials (default `admin`/`admin`) |
 
 ### Redis production hardening
 
-- **AUTH/ACL**: set `REDIS_PASSWORD` (or `SPRING_DATA_REDIS_USERNAME`/`SPRING_DATA_REDIS_PASSWORD` for ACL users). Compose applies `--requirepass` automatically when set.
+- **AUTH/ACL**: set `REDIS_PASSWORD` (or `SPRING_DATA_REDIS_USERNAME`/`SPRING_DATA_REDIS_PASSWORD` for ACL users). Compose applies `--requirepass` automatically when set — on the standalone Redis **and** on the HA replica (`--masterauth`) and Sentinel (`sentinel auth-pass`), so the whole topology authenticates. Verified live: unauthenticated `PING` gets `NOAUTH`, and failover works with auth enabled.
 - **TLS**: `REDIS_SSL=true` (and the standard `SPRING_DATA_REDIS_SSL_*` properties) for encrypted transport.
 - **High availability**: run the Sentinel topology (master + replica + Sentinel) with the additive compose file:
   ```bash
@@ -192,11 +199,14 @@ Available environment variable overrides:
 
 ## Monitoring & Alerting
 
-Run Prometheus + Alertmanager alongside the stack:
+Run the full observability stack (Prometheus, Alertmanager, Loki, promtail, Grafana) alongside the app:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
-# Prometheus: http://localhost:9090 (alerts at /alerts), Alertmanager: http://localhost:9093
+docker compose -f docker-compose.yml -f docker-compose.redis-ha.yml -f docker-compose.monitoring.yml up -d --build
+# Prometheus:   http://localhost:9090 (alerts at /alerts, targets at /targets)
+# Alertmanager: http://localhost:9093
+# Grafana:      http://localhost:3000 (admin / GRAFANA_ADMIN_PASSWORD, default "admin")
+# Loki API:     http://localhost:3100
 ```
 
 `monitoring/alerts.yml` ships six rules (validated against the live deployment):
@@ -210,7 +220,12 @@ docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
 | `HighApiKeyFailures` | sustained bad API keys (credential stuffing) | warning |
 | `HighLatencyP99` | p99 `http_server_requests_seconds` > 1s for 5m | warning |
 
-`monitoring/alertmanager.yml` is a placeholder — point the webhook at your receiver (Slack/PagerDuty/Opsgenie).
+- **Logs**: promtail ships every `rate-*` container's stdout to Loki via the Docker socket. Logs are labeled with `container`, `container_id`, `service` (compose service name) and `job="containers"` — e.g. query `{container="rate-app-1"}` in Grafana Explore or at `http://localhost:3100/loki/api/v1/query_range?query=%7Bcontainer%3D%22rate-app-1%22%7D`.
+- **Dashboards**: Grafana auto-provisions a `Rate Limiter` dashboard (`monitoring/grafana/dashboards/rate-limiter.json`): request rate per algorithm, throttled (429) rate, throttle ratio, fail-open rate, breaker state, p95/p99 latency, 5xx rate.
+- **Alertmanager receiver**: `monitoring/alertmanager.yml` is a template whose `__RECEIVER_URL__` placeholder is replaced at container start from the `RECEIVER_URL` environment variable — point it at your Slack/PagerDuty/Opsgenie webhook instead of editing the config:
+  ```bash
+  RECEIVER_URL=https://hooks.slack.com/services/... docker compose ... up -d
+  ```
 
 ## SLOs (defaults)
 
@@ -265,6 +280,8 @@ mvn verify      # full build including tests (Docker required for Testcontainers
 1. JDK 21 + Maven setup (cached dependencies).
 2. `mvn --batch-mode clean verify` — Testcontainers uses the runner's Docker daemon.
 3. `docker build` to prove the Dockerfile is healthy.
+
+Dependabot (`.github/dependabot.yml`) opens weekly PRs for Maven, GitHub Actions and Docker image updates.
 
 ## Logging
 

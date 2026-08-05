@@ -1,8 +1,10 @@
-# Monitoring profile: Prometheus + Alertmanager for the rate limiter stack.
+# Observability profile: Prometheus + Alertmanager + Loki + promtail + Grafana.
 # Usage:
-#   docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
-# Prometheus:    http://localhost:9090  (alerts at /alerts, targets at /targets)
-# Alertmanager:  http://localhost:9093
+#   docker compose -f docker-compose.yml -f docker-compose.redis-ha.yml -f docker-compose.monitoring.yml up -d
+# Prometheus:   http://localhost:9090  (alerts at /alerts, targets at /targets)
+# Alertmanager: http://localhost:9093
+# Grafana:      http://localhost:3000  (admin / GRAFANA_ADMIN_PASSWORD, default "admin")
+# Loki API:     http://localhost:3100
 services:
   prometheus:
     image: prom/prometheus:v2.53.4
@@ -21,8 +23,45 @@ services:
 
   alertmanager:
     image: prom/alertmanager:v0.27.0
+    entrypoint: ["sh", "-c"]
+    environment:
+      # Receiver webhook URL; rendered into the config from the template below.
+      - RECEIVER_URL=${RECEIVER_URL:-http://placeholder-receiver:8080/hooks}
+    command: ["sed \"s|__RECEIVER_URL__|$$RECEIVER_URL|g\" /etc/alertmanager/alertmanager.yml.tpl > /tmp/alertmanager.yml && exec /bin/alertmanager --config.file=/tmp/alertmanager.yml --web.listen-address=:9093"]
     volumes:
-      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml.tpl:ro
     ports:
       - "9093:9093"
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.3.2
+    command: -config.file=/etc/loki/loki-config.yml
+    volumes:
+      - ./monitoring/loki-config.yml:/etc/loki/loki-config.yml:ro
+    ports:
+      - "3100:3100"
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:3.3.2
+    command: -config.file=/etc/promtail/promtail-config.yml
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./monitoring/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+    volumes:
+      - ./monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./monitoring/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
     restart: unless-stopped

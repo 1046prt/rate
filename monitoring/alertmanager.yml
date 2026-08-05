@@ -1,5 +1,6 @@
-# Minimal Alertmanager config: route everything to a placeholder webhook.
-# Replace the webhook_configs URL with your own receiver (Slack, PagerDuty, Opsgenie, ...).
+# Alertmanager config template. The docker-compose.monitoring.yml entrypoint
+# renders __RECEIVER_URL__ from the RECEIVER_URL env var (see .env.example),
+# e.g. a Slack webhook, PagerDuty or Opsgenie URL.
 route:
   group_by: ["alertname", "severity"]
   group_wait: 30s
@@ -10,4 +11,4 @@ route:
 receivers:
   - name: default
     webhook_configs:
-      - url: "http://placeholder-receiver:8080/hooks"
+      - url: "__RECEIVER_URL__"

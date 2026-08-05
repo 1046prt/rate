@@ -29,12 +29,14 @@ services:
 
   redis-replica:
     image: redis:7-alpine
-    command: ["sh", "-c", "until redis-cli -h redis ping >/dev/null 2>&1; do sleep 1; done; exec redis-server --appendonly yes --replicaof redis 6379"]
+    command: ["sh", "-c", "AUTH_ARGS=\"\"; if [ -n \"$$REDIS_PASSWORD\" ]; then AUTH_ARGS=\"-a $$REDIS_PASSWORD\"; fi; until redis-cli $$AUTH_ARGS -h redis ping | grep -q PONG; do sleep 1; done; REPL_ARGS=\"--appendonly yes --replicaof redis 6379\"; if [ -n \"$$REDIS_PASSWORD\" ]; then REPL_ARGS=\"$$REPL_ARGS --masterauth $$REDIS_PASSWORD\"; fi; exec redis-server $$REPL_ARGS"]
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
     depends_on:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "redis-cli", "-h", "redis", "ping"]
+      test: ["CMD-SHELL", "if [ -n \"$$REDIS_PASSWORD\" ]; then redis-cli -h redis -a \"$$REDIS_PASSWORD\" ping | grep PONG; else redis-cli -h redis ping | grep PONG; fi"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -42,7 +44,9 @@ services:
 
   sentinel:
     image: redis:7-alpine
-    command: ["sh", "-c", "printf 'port 26379\\nsentinel monitor mymaster 172.28.0.10 6379 1\\nsentinel down-after-milliseconds mymaster 5000\\nsentinel failover-timeout mymaster 10000\\nsentinel parallel-syncs mymaster 1\\n' > /tmp/sentinel.conf && exec redis-sentinel /tmp/sentinel.conf"]
+    command: ["sh", "-c", "printf 'port 26379\\nsentinel monitor mymaster 172.28.0.10 6379 1\\nsentinel down-after-milliseconds mymaster 5000\\nsentinel failover-timeout mymaster 10000\\nsentinel parallel-syncs mymaster 1\\n' > /tmp/sentinel.conf; if [ -n \"$$REDIS_PASSWORD\" ]; then printf 'sentinel auth-pass mymaster %s\\n' \"$$REDIS_PASSWORD\" >> /tmp/sentinel.conf; fi; exec redis-sentinel /tmp/sentinel.conf"]
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
     depends_on:
       redis:
         condition: service_healthy
