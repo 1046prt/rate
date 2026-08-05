@@ -9,11 +9,14 @@ A **Spring Boot** (Java 21) micro-service that provides rate-limiting as a servi
 - **Resilient to Redis outages**: circuit breaker + 500 ms command timeout + fail-open (never 500s), with dedicated failure metrics.
 - Optional API-key authentication (`X-Api-Key` header); published Docker config fails closed, see [Authentication](#authentication).
 - Micrometer metrics with a Prometheus exporter.
-- TLS profiles (`dev`/`prod`) using an embedded PKCS12 keystore.
+- TLS profiles (`dev`/`prod`) using an embedded PKCS12 keystore; recommended edge TLS via Caddy (verified working).
 - Swagger UI at `/swagger-ui.html`.
 - Docker Compose bringing up the app + Redis with healthchecks (optional Redis AUTH password).
+- Redis **AOF persistence** (everysec) + data volumes on master and replica — state survives restarts and failover.
+- Horizontal scaling: stateless app replicas sharing Redis state, Caddy load balancing, Prometheus DNS discovery per replica (all verified live).
 - Testcontainers-based integration tests, including a Redis-down fail-open test (require a running Docker daemon).
-- GitHub Actions CI: full `mvn clean verify` (tests included) + Docker image build.
+- GitHub Actions CI: full `mvn clean verify` (tests included) + Docker image build + **Trivy vulnerability scan + CycloneDX SBOM**.
+- Operations runbook: [`RUNBOOK.md`](RUNBOOK.md) — per-alert procedures, failover drill, backup/restore, scaling, upgrades.
 
 ## Build & Run
 
@@ -53,11 +56,14 @@ docker compose -f docker-compose.yml -f docker-compose.redis-ha.yml -f docker-co
 **Recommended: terminate TLS at the edge proxy** (the app stays plain HTTP on the internal network):
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d --build
+docker compose -f docker-compose.yml -f docker-compose.redis-ha.yml \
+  -f docker-compose.monitoring.yml -f docker-compose.tls.yml up -d --build --scale app=2
 # https://localhost (Caddy issues an internal cert; for a real domain set
 # TLS_DOMAIN in .env and remove `tls internal` from caddy/Caddyfile for
 # automatic Let's Encrypt certificates)
 ```
+
+The TLS overlay was smoke-tested: HTTPS serves through Caddy, the app publishes **no host port** in this mode (edge-only exposure), and Caddy round-robins between scaled replicas (kill a replica and traffic continues on the survivor). In TLS mode the app is NOT reachable on `http://localhost:8080` — use `https://localhost`.
 
 Alternatively the app can serve TLS itself via the `dev`/`prod` profiles, using `src/main/resources/keystore.p12`. It is checked in for development convenience only — regenerate it for any real deployment and keep the password in a secret store:
 
@@ -195,7 +201,13 @@ Available environment variable overrides:
   ```
   The app connects via `SPRING_DATA_REDIS_SENTINEL_MASTER`/`SPRING_DATA_REDIS_SENTINEL_NODES`; failover is automatic and was live-tested (killed master → replica promoted in ~15 s → app kept serving, limits kept enforcing, old master rejoined as replica on restart). Sentinel must monitor the master by **static IP or stable VIP, never a hostname** — a stopped container's DNS name disappears and breaks the failover.
 - **State across failover**: with a warm replica (as in this topology), rate-limit state survives failover because the promoted node holds replicated data — limits keep enforcing seamlessly. State resets only if the new primary comes up cold (e.g., full cluster loss). Either way limits re-learn instantly; both behaviors are acceptable, just be aware of which one you get.
-- **Persistence**: compose Redis uses defaults (RDB snapshots). Enable AOF (`--appendonly yes`) if you want limits to survive Redis restarts.
+- **Persistence**: AOF is enabled (`--appendonly yes --appendfsync everysec`) on the master and the replica, and both hold named data volumes (`redis-data`, `redis-replica-data`) — state survives container restarts and recreation. Back up regularly (see the [runbook](RUNBOOK.md#backup--restore) for the exact BGSAVE + tar procedure).
+- **Horizontal scaling**: the app is stateless (all state lives in Redis), so replicas scale cleanly:
+  ```bash
+  docker compose -f docker-compose.yml -f docker-compose.redis-ha.yml \
+    -f docker-compose.monitoring.yml -f docker-compose.tls.yml up -d --scale app=2
+  ```
+  Caddy round-robins across replicas (`caddy/Caddyfile`), Prometheus scrapes each replica via DNS discovery, and each appears as its own `container` in Loki. See the [runbook](RUNBOOK.md#scaling).
 
 ## Monitoring & Alerting
 
@@ -205,9 +217,11 @@ Run the full observability stack (Prometheus, Alertmanager, Loki, promtail, Graf
 docker compose -f docker-compose.yml -f docker-compose.redis-ha.yml -f docker-compose.monitoring.yml up -d --build
 # Prometheus:   http://localhost:9090 (alerts at /alerts, targets at /targets)
 # Alertmanager: http://localhost:9093
-# Grafana:      http://localhost:3000 (admin / GRAFANA_ADMIN_PASSWORD, default "admin")
+# Grafana:      http://localhost:3000 (admin / GRAFANA_ADMIN_PASSWORD — REQUIRED env, no default)
 # Loki API:     http://localhost:3100
 ```
+
+All monitoring ports bind to **127.0.0.1 only** (not exposed to the LAN). Grafana fails closed: `docker compose up` errors out unless `GRAFANA_ADMIN_USER`/`GRAFANA_ADMIN_PASSWORD` are set in `.env` (same pattern as the API key).
 
 `monitoring/alerts.yml` ships six rules (validated against the live deployment):
 
@@ -226,6 +240,9 @@ docker compose -f docker-compose.yml -f docker-compose.redis-ha.yml -f docker-co
   ```bash
   RECEIVER_URL=https://hooks.slack.com/services/... docker compose ... up -d
   ```
+  Routing groups by alert/severity/instance, pages criticals immediately (10s, 1h repeat) and adds an inhibit rule so `RedisFailingOpen` is silenced while `RedisCircuitBreakerOpen` is open.
+
+Full operational procedures (alert-by-alert responses, failover drill, backup/restore, scaling, upgrade, incident template) live in [`RUNBOOK.md`](RUNBOOK.md).
 
 ## SLOs (defaults)
 
@@ -280,6 +297,8 @@ mvn verify      # full build including tests (Docker required for Testcontainers
 1. JDK 21 + Maven setup (cached dependencies).
 2. `mvn --batch-mode clean verify` — Testcontainers uses the runner's Docker daemon.
 3. `docker build` to prove the Dockerfile is healthy.
+4. **Trivy scan** of the built image (fails on unfixed HIGH/CRITICAL) — the scan found and blocked CVE-2026-59901 (netty-codec) and base-image Alpine CVEs during development; the Dockerfile now pins the netty fix and runs `apk upgrade` at build time.
+5. **CycloneDX SBOM** generated from the image and uploaded as a CI artifact.
 
 Dependabot (`.github/dependabot.yml`) opens weekly PRs for Maven, GitHub Actions and Docker image updates.
 

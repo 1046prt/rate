@@ -1,7 +1,10 @@
 # TLS edge profile: terminate HTTPS at a Caddy reverse proxy instead of exposing
 # the app directly. Usage:
-#   docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d --build
+#   docker compose -f docker-compose.yml -f docker-compose.redis-ha.yml \
+#     -f docker-compose.monitoring.yml -f docker-compose.tls.yml up -d --build --scale app=2
 # Then open https://localhost (or https://<TLS_DOMAIN>).
+# NOTE: in TLS mode the app publishes NO host port (edge-only exposure), so
+# http://localhost:8080 is not reachable - use https://localhost instead.
 services:
   app:
     # The app itself stays on the internal network only; no host port published

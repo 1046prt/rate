@@ -7,9 +7,10 @@
 # because a stopped container's DNS name disappears (same applies in real infra - monitor by IP
 # or a stable VIP, never a name that goes away with the node).
 #
-# NOTE: rate-limit state lives on the Redis primary; after a failover the new primary starts
-# with fresh state, so per-client windows reset. That is acceptable for rate limiting (limits
-# re-learn instantly) but verify it matches your requirements before relying on it.
+# NOTE: rate-limit state lives on the Redis primary. AOF persistence (--appendonly yes)
+# is enabled on both master and replica and both hold a data volume, so state survives
+# restarts; with a warm replica it also survives failover (the promoted node keeps the
+# replicated + append-only data). Verify it matches your requirements before relying on it.
 networks:
   default:
     ipam:
@@ -29,9 +30,11 @@ services:
 
   redis-replica:
     image: redis:7-alpine
-    command: ["sh", "-c", "AUTH_ARGS=\"\"; if [ -n \"$$REDIS_PASSWORD\" ]; then AUTH_ARGS=\"-a $$REDIS_PASSWORD\"; fi; until redis-cli $$AUTH_ARGS -h redis ping | grep -q PONG; do sleep 1; done; REPL_ARGS=\"--appendonly yes --replicaof redis 6379\"; if [ -n \"$$REDIS_PASSWORD\" ]; then REPL_ARGS=\"$$REPL_ARGS --masterauth $$REDIS_PASSWORD\"; fi; exec redis-server $$REPL_ARGS"]
+    command: ["sh", "-c", "AUTH_ARGS=\"\"; if [ -n \"$$REDIS_PASSWORD\" ]; then AUTH_ARGS=\"-a $$REDIS_PASSWORD\"; fi; until redis-cli $$AUTH_ARGS -h redis ping | grep -q PONG; do sleep 1; done; REPL_ARGS=\"--appendonly yes --appendfsync everysec --replicaof redis 6379\"; if [ -n \"$$REDIS_PASSWORD\" ]; then REPL_ARGS=\"$$REPL_ARGS --masterauth $$REDIS_PASSWORD\"; fi; exec redis-server $$REPL_ARGS"]
     environment:
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+    volumes:
+      - redis-replica-data:/data
     depends_on:
       redis:
         condition: service_healthy
@@ -56,3 +59,6 @@ services:
       timeout: 3s
       retries: 5
     restart: unless-stopped
+
+volumes:
+  redis-replica-data:

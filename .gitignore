@@ -1,6 +1,7 @@
 target/
 .env
 *.log
+sbom.cdx.json
 
 # IDE
 .idea/

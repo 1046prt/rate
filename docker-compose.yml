@@ -20,9 +20,11 @@ services:
     image: redis:7-alpine
     container_name: rate-limiter-redis
     # Applies --requirepass only when REDIS_PASSWORD is set (empty = no auth)
-    command: ["sh", "-c", "if [ -n \"$${REDIS_PASSWORD}\" ]; then exec redis-server --requirepass \"$${REDIS_PASSWORD}\"; else exec redis-server; fi"]
+    command: ["sh", "-c", "if [ -n \"$${REDIS_PASSWORD}\" ]; then exec redis-server --requirepass \"$${REDIS_PASSWORD}\" --appendonly yes --appendfsync everysec; else exec redis-server --appendonly yes --appendfsync everysec; fi"]
     environment:
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+    volumes:
+      - redis-data:/data
     # Expose Redis port only internally by default; comment out the next line if you need host access
     # ports:
     #   - "6379:6379"
@@ -32,3 +34,6 @@ services:
       timeout: 3s
       retries: 5
     restart: unless-stopped
+
+volumes:
+  redis-data:

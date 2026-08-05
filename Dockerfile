@@ -10,6 +10,8 @@ RUN mvn clean package -DskipTests
 
 # Stage 2: Run the application with a lightweight JRE (Alpine includes wget for the healthcheck)
 FROM eclipse-temurin:21-jre-alpine
+# Upgrade OS packages: base-image tags lag behind alpine security fixes (libexpat, p11-kit, ...)
+RUN apk upgrade --no-cache
 WORKDIR /app
 COPY --from=build /app/target/*.jar app.jar
 EXPOSE 8080
