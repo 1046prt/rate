@@ -7,6 +7,19 @@ updates:
     open-pull-requests-limit: 10
     commit-message:
       prefix: "deps"
+    # Major bumps historically break the build or the runtime:
+    # Spring Boot 4, Testcontainers 2 (JDK 25 rewrite), springdoc 3 (merge-time
+    # crash), logstash-logback-encoder 9 (BackwardIncompatibleChanges).
+    # Stay on majors until we deliberately plan the migration.
+    ignore:
+      - dependency-name: "org.springframework.boot:*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "org.testcontainers:*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "org.springdoc:*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "net.logstash.logback:*"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
@@ -21,3 +34,10 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "deps"
+    # JDK 24/25 base image major bumps have only caused CI churn; JDK 21 is
+    # the pinned LTS until the platform moves.
+    ignore:
+      - dependency-name: "eclipse-temurin"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "maven"
+        update-types: ["version-update:semver-major"]

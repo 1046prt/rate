@@ -125,4 +125,36 @@ class ApiKeyAuthFilterTest {
         verify(chain).doFilter(request, response);
         assertNull(SecurityContextHolder.getContext().getAuthentication());
     }
+
+    @Test
+    void swaggerPathWithoutKeyReturns401() throws Exception {
+        ApiKeyAuthFilter filter = filterWithKey();
+        HttpServletRequest request = mock(HttpServletRequest.class);
+        HttpServletResponse response = mock(HttpServletResponse.class);
+        FilterChain chain = mock(FilterChain.class);
+        StringWriter body = new StringWriter();
+        when(request.getRequestURI()).thenReturn("/swagger-ui/index.html");
+        when(request.getHeader("X-Api-Key")).thenReturn(null);
+        when(response.getWriter()).thenReturn(new PrintWriter(body));
+
+        filter.doFilter(request, response, chain);
+
+        verify(chain, never()).doFilter(request, response);
+        verify(response).setStatus(401);
+    }
+
+    @Test
+    void swaggerPathWithValidKeyAuthenticates() throws Exception {
+        ApiKeyAuthFilter filter = filterWithKey();
+        HttpServletRequest request = mock(HttpServletRequest.class);
+        HttpServletResponse response = mock(HttpServletResponse.class);
+        FilterChain chain = mock(FilterChain.class);
+        when(request.getRequestURI()).thenReturn("/v3/api-docs");
+        when(request.getHeader("X-Api-Key")).thenReturn(KEY);
+
+        filter.doFilter(request, response, chain);
+
+        verify(chain).doFilter(request, response);
+        assertTrue(SecurityContextHolder.getContext().getAuthentication().isAuthenticated());
+    }
 }

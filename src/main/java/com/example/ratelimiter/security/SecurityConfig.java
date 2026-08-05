@@ -14,8 +14,8 @@ import org.springframework.security.web.header.writers.StaticHeadersWriter;
 /**
  * Single, ordered security filter chain for the whole application:
  * <ul>
- *   <li>API-key authentication for {@code /api/v1/**} (see {@link ApiKeyAuthFilter})</li>
- *   <li>public health / Prometheus / Swagger endpoints</li>
+ *   <li>API-key authentication for {@code /api/v1/**} and the Swagger/OpenAPI endpoints (see {@link ApiKeyAuthFilter})</li>
+ *   <li>public health / Prometheus endpoints</li>
  *   <li>all other actuator endpoints denied</li>
  *   <li>security headers (HSTS, CSP, nosniff, frame, referrer) applied to every response</li>
  * </ul>
@@ -46,10 +46,10 @@ public class SecurityConfig {
                 .addHeaderWriter(new StaticHeadersWriter("X-Frame-Options", "DENY"))
                 .addHeaderWriter(new StaticHeadersWriter("Referrer-Policy", "no-referrer")))
             .authorizeHttpRequests(authz -> authz
-                .requestMatchers("/actuator/health", "/actuator/prometheus",
-                        "/swagger-ui.html", "/swagger-ui/**", "/v3/api-docs/**").permitAll()
+                .requestMatchers("/actuator/health", "/actuator/prometheus").permitAll()
                 .requestMatchers("/actuator/**").denyAll()
-                .requestMatchers("/api/v1/**").authenticated()
+                .requestMatchers("/api/v1/**", "/swagger-ui.html", "/swagger-ui/**",
+                        "/v3/api-docs/**").authenticated()
                 .anyRequest().permitAll())
             .addFilterBefore(apiKeyFilter, UsernamePasswordAuthenticationFilter.class)
             .sessionManagement(sm -> sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS))

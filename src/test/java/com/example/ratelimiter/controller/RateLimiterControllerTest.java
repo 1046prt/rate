@@ -12,9 +12,12 @@ import org.springframework.context.annotation.Import;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -97,6 +100,18 @@ public class RateLimiterControllerTest {
     }
 
     @Test
+    void rejectsUnknownPathWith404() {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.set("X-Api-Key", API_KEY);
+        HttpEntity<String> request = new HttpEntity<>("{}", headers);
+        ResponseEntity<Map> response =
+                restTemplate.postForEntity("/api/v1/nonexistent", request, Map.class);
+        assertEquals(HttpStatus.NOT_FOUND, response.getStatusCode());
+        assertEquals("Resource not found", response.getBody().get("message"));
+    }
+
+    @Test
     void rejectsMissingApiKeyWith401() {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
@@ -107,6 +122,20 @@ public class RateLimiterControllerTest {
         ResponseEntity<String> response = restTemplate.postForEntity("/api/v1/check", noKey, String.class);
         assertEquals(HttpStatus.UNAUTHORIZED, response.getStatusCode());
         assertTrue(response.getBody().contains("Invalid API key"));
+    }
+
+    @Test
+    void swaggerDocsRequireApiKey() {
+        ResponseEntity<String> noKey = restTemplate.getForEntity("/v3/api-docs", String.class);
+        assertEquals(HttpStatus.UNAUTHORIZED, noKey.getStatusCode());
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("X-Api-Key", API_KEY);
+        ResponseEntity<String> withKey =
+                restTemplate.exchange("/v3/api-docs", HttpMethod.GET,
+                        new HttpEntity<>(headers), String.class);
+        assertEquals(HttpStatus.OK, withKey.getStatusCode());
+        assertTrue(withKey.getBody().contains("/api/v1/check"));
     }
 
     private ResponseEntity<CheckResponseDto> post(String clientId, String algorithm) {

@@ -33,7 +33,7 @@ services:
 
   redis-replica:
     image: redis:7-alpine
-    command: ["sh", "-c", "AUTH_ARGS=\"\"; if [ -n \"$$REDIS_PASSWORD\" ]; then AUTH_ARGS=\"-a $$REDIS_PASSWORD\"; fi; until redis-cli $$AUTH_ARGS -h redis ping | grep -q PONG; do sleep 1; done; REPL_ARGS=\"--appendonly yes --appendfsync everysec --replicaof redis 6379\"; if [ -n \"$$REDIS_PASSWORD\" ]; then REPL_ARGS=\"$$REPL_ARGS --masterauth $$REDIS_PASSWORD\"; fi; exec redis-server $$REPL_ARGS"]
+    command: ["sh", "-c", "AUTH_ARGS=\"\"; if [ -n \"$$REDIS_PASSWORD\" ]; then AUTH_ARGS=\"-a $$REDIS_PASSWORD\"; fi; until redis-cli $$AUTH_ARGS -h redis ping | grep -q PONG; do sleep 1; done; REPL_ARGS=\"--appendonly yes --appendfsync everysec --replicaof redis 6379\"; if [ -n \"$$REDIS_PASSWORD\" ]; then REPL_ARGS=\"$$REPL_ARGS --masterauth $$REDIS_PASSWORD --requirepass $$REDIS_PASSWORD\"; fi; exec redis-server $$REPL_ARGS"]
     environment:
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
     volumes:
@@ -42,7 +42,7 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "if [ -n \"$$REDIS_PASSWORD\" ]; then redis-cli -h redis -a \"$$REDIS_PASSWORD\" ping | grep PONG; else redis-cli -h redis ping | grep PONG; fi"]
+      test: ["CMD-SHELL", "if [ -n \"$$REDIS_PASSWORD\" ]; then redis-cli -a \"$$REDIS_PASSWORD\" ping | grep PONG; else redis-cli ping | grep PONG; fi"]
       interval: 5s
       timeout: 3s
       retries: 5

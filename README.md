@@ -217,7 +217,7 @@ Interactive docs (with a "Try it out" button): [`/swagger-ui.html`](https://loca
 
 ### Authentication
 
-When `RATELIMITER_API_KEY` is set, every request to `/api/v1/**` must carry it in the `X-Api-Key` header (header names are case-insensitive). With no key configured the API is open. Swagger UI offers "Authorize" for the `X-Api-Key` scheme.
+When `RATELIMITER_API_KEY` is set, every request to `/api/v1/**` **and** to the Swagger/OpenAPI endpoints (`/swagger-ui.html`, `/swagger-ui/**`, `/v3/api-docs/**`) must carry it in the `X-Api-Key` header (header names are case-insensitive). With no key configured the API and the docs are open. Swagger UI offers "Authorize" for the `X-Api-Key` scheme.
 
 ```bash
 curl https://api.example.com/api/v1/check \
@@ -275,7 +275,7 @@ Example conversation (limit 100/60 s):
 
 State is shared across replicas (Redis), so the same limits hold no matter which replica answers.
 
-Other endpoints: `/actuator/health`, `/actuator/prometheus`, `/v3/api-docs`, `/swagger-ui.html`.
+Other endpoints: `/actuator/health` and `/actuator/prometheus` are public; `/v3/api-docs` and `/swagger-ui.html` require the `X-Api-Key` header when one is configured.
 
 ## Configuration
 

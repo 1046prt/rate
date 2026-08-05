@@ -19,8 +19,10 @@ import java.util.List;
 /**
  * API-key authentication filter for the rate limiter API.
  *
- * <p>Only enforced on {@code /api/v1/**} paths; actuator and Swagger endpoints stay public.
- * The key is read from the {@code X-Api-Key} header (header names are case-insensitive).
+ * <p>Enforced on {@code /api/v1/**} plus the Swagger/OpenAPI endpoints
+ * ({@code /swagger-ui/**} and {@code /v3/api-docs/**}); actuator health and Prometheus
+ * endpoints stay public. The key is read from the {@code X-Api-Key} header
+ * (header names are case-insensitive).
  *
  * <p>On a valid key (or when no key is configured &mdash; open access), an authentication token is
  * placed in the {@link SecurityContextHolder} so the {@code authenticated()} authorization rule
@@ -30,6 +32,7 @@ public class ApiKeyAuthFilter extends OncePerRequestFilter {
 
     public static final String API_KEY_HEADER = "X-Api-Key";
     private static final String API_PATH_PREFIX = "/api/v1";
+    private static final String[] PROTECTED_PREFIXES = {API_PATH_PREFIX, "/swagger-ui", "/v3/api-docs"};
 
     private final RateLimiterProperties properties;
     private final Counter invalidApiKeyCounter;
@@ -44,7 +47,7 @@ public class ApiKeyAuthFilter extends OncePerRequestFilter {
                                     HttpServletResponse response,
                                     FilterChain filterChain) throws ServletException, IOException {
         String path = request.getRequestURI();
-        if (path == null || !path.startsWith(API_PATH_PREFIX)) {
+        if (!isProtectedPath(path)) {
             filterChain.doFilter(request, response);
             return;
         }
@@ -67,6 +70,18 @@ public class ApiKeyAuthFilter extends OncePerRequestFilter {
             response.setContentType("application/json");
             response.getWriter().write("{\"error\":\"Invalid API key\"}");
         }
+    }
+
+    private boolean isProtectedPath(String path) {
+        if (path == null) {
+            return false;
+        }
+        for (String prefix : PROTECTED_PREFIXES) {
+            if (path.startsWith(prefix)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void setAuthenticated() {
