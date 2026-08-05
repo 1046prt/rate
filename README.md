@@ -1,167 +1,251 @@
 # Rate Limiter Service
 
-A **Spring Boot** (Java 21) micro-service that provides rate-limiting as a service (RLaaS). It implements five classic algorithms with **Redis** for distributed state, using atomic Lua scripts so concurrent requests are safe. Built to survive Redis outages: every Redis call runs behind a circuit breaker with a fail-open policy (see [Resilience](#resilience)). Includes optional API-key auth, TLS profiles, Prometheus metrics, and Testcontainers integration tests.
+**Distributed rate-limiting as a service (RLaaS)** — a Spring Boot microservice that decides, per client, whether a request is allowed or throttled (HTTP 429). Five classic algorithms, **Redis-backed shared state** (atomic Lua scripts — concurrency-safe), a Redis HA topology with Sentinel failover, a TLS edge, and full observability. Hardened for production and load-tested.
+
+![Java 21](https://img.shields.io/badge/Java-21-orange) ![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.5-green) ![Redis](https://img.shields.io/badge/Redis-7-red) ![CI](https://github.com/1046prt/rate/actions/workflows/ci.yml/badge.svg) ![License](https://img.shields.io/badge/License-MIT-blue)
+
+## At a glance
+
+- **A rate limiter you deploy once, and point every API at** — `POST /api/v1/check` with a `clientId` and an algorithm choice; get `allowed: true/false` + standard rate-limit headers back.
+- **Distributed by design**: all counters live in Redis, so N replicas enforce the same limits — no per-instance state, no window leakage under scaling.
+- **Survives Redis outages**: every Redis call sits behind a Resilience4j circuit breaker with a **fail-open** policy — the limiter degrades, it never 500s.
+- **HA topology verified live**: Sentinel failover (master killed → replica promoted in ~15 s → limits keep enforcing, old master rejoins as replica), 3-sentinel quorum (quorum 2), AOF persistence + data volumes.
+- **Production shape load-tested**: ~2,400 req/s through the TLS edge at **0.00% 5xx**, p95 44.9 ms (edge) / 13.5 ms (in-app).
+- **CI/CD that actually gates**: tests → Docker build → Trivy vulnerability scan → CycloneDX SBOM → GHCR publish. It blocked CVE-2026-59901 during development.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Internet
+        C[Client / API consumer]
+    end
+
+    subgraph "Edge"
+        CAD["Caddy\nTLS termination + round-robin LB"]
+    end
+
+    subgraph "Application tier (stateless replicas)"
+        A1["App replica 1 :8080"]
+        A2["App replica 2 :8080"]
+        GUARD["RedisGuard\ncircuit breaker\n(fail-open)"]
+    end
+
+    subgraph "Redis HA tier"
+        S1["Sentinel 1 :26379"]
+        S2["Sentinel 2 :26379"]
+        S3["Sentinel 3 :26379"]
+        M["Redis master :6379\n(AOF everysec)"]
+        R["Redis replica :6379\n(AOF everysec)"]
+    end
+
+    subgraph "Observability (loopback-only)"
+        PROM["Prometheus"]
+        AM["Alertmanager → webhook"]
+        LOKI["Loki"]
+        GRAF["Grafana"]
+        PT["promtail"]
+    end
+
+    C -->|"HTTPS :443"| CAD
+    CAD --> A1 & A2
+    A1 & A2 --> GUARD
+    GUARD -->|"Lettuce, 500ms timeout"| M
+    M --> R
+    S1 & S2 & S3 -. "monitor by static IP" .-> M
+    A1 & A2 -. "sentinel discovery" .-> S1 & S2 & S3
+    M -. "failover promotes" .-> R
+    A1 & A2 -->|"/actuator/prometheus"| PROM
+    PROM --> AM
+    A1 & A2 -->|"JSON logs"| PT
+    PT --> LOKI
+    PROM & LOKI --> GRAF
+```
+
+**Reading the diagram**: clients hit only the Caddy edge. Replicas are stateless — every limit decision is an atomic Redis transaction. Sentinel nodes watch the master by static IP and elect a replacement when it dies. Prometheus scrapes each replica individually (DNS service discovery), promtail ships each container's logs to Loki, and Grafana visualizes both. All monitoring ports bind to loopback only.
+
+## Request flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant CAD as Caddy (TLS edge)
+    participant A as App replica
+    participant G as RedisGuard (breaker)
+    participant RD as Redis
+
+    C->>CAD: POST /api/v1/check {clientId, algorithm} + X-Api-Key
+    CAD->>A: round-robin to a replica
+    A->>G: check Redis availability
+    alt Redis healthy (breaker closed)
+        G->>RD: atomic Lua script (state transition)
+        RD-->>G: decision: allowed / rejected
+    else Redis down or breaker open
+        G-->>A: fail-open: allow + increment ratelimiter_redis_fallback_total
+    end
+    A-->>C: 200 {allowed: true} + X-RateLimit-Limit/Remaining
+    Note over A,C: or 429 {allowed: false} + Retry-After
+```
+
+## Redis Sentinel failover
+
+```mermaid
+sequenceDiagram
+    participant S1 as Sentinel 1
+    participant S2 as Sentinel 2
+    participant S3 as Sentinel 3
+    participant M as Redis master (172.28.0.10)
+    participant R as Redis replica (172.28.0.6)
+    participant A as App replicas
+
+    S1->>M: PING (every 1s)
+    S2->>M: PING
+    S3->>M: PING
+    Note over M: master dies
+    S1->>S1: master is down (down-after-milliseconds: 5s)
+    S1->>S2: I mark master as down
+    S2->>S1: quorum reached (2/3)
+    S3->>S2: quorum reached (2/3)
+    S1->>R: SLAVEOF NO ONE → promote
+    Note over R: R is now the new master (config-epoch 1)
+    A->>S1: where is the master? (sentinel nodes in app config)
+    A->>S2: where is the master?
+    A->>S3: where is the master?
+    S1-->>A: 172.28.0.6:6379
+    A->>R: continue serving (limits keep enforcing)
+    Note over M: old master rejoins
+    S1->>M: reconfigure as replica of new master
+    M->>R: full resync (repl-offset catches up)
+```
+
+**Live-verified drill** (see [`RUNBOOK.md`](RUNBOOK.md)): killed one sentinel, then the master — failover still completed with 2/3 sentinels, the app served requests throughout, and the old master rejoined as a replica on restart.
+
+## Rate limiter algorithm flow
+
+```mermaid
+flowchart TD
+    REQ["Request: clientId + algorithm"] --> KEY{API key valid?}
+    KEY -->|no| 401["401 Invalid API key"]
+    KEY -->|yes| ALG["Pick algorithm implementation"]
+    ALG --> GUARD{Redis breaker closed?}
+    GUARD -->|no| OPEN["FAIL OPEN: allow + metric\n(never a 5xx)"]
+    GUARD -->|yes| LUA["Atomic Lua script in Redis:\nstate transition + decision in ONE script"]
+    LUA --> ALLOW["allow: increment counter\nX-RateLimit-Remaining"]
+    LUA --> REJ["reject: 429\nRetry-After header"]
+    ALLOW --> M["Metrics:\nratelimiter_requests_allowed_total"]
+    REJ --> M
+```
+
+Every algorithm's state transition — read, mutate, expire — runs inside **one Lua script**, so concurrent requests from any number of replicas can never race.
+
+## CI/CD pipeline
+
+```mermaid
+flowchart LR
+    PUSH["push / pull_request"] --> MVN["mvn clean verify\n34 tests incl. Testcontainers"]
+    MVN --> DOCKER["docker build"]
+    DOCKER --> TRIVY{"Trivy scan\nHIGH/CRITICAL?"}
+    TRIVY -->|"found"| FAIL["✗ CI fails — merge blocked"]
+    TRIVY -->|"clean"| SBOM["CycloneDX SBOM artifact"]
+    SBOM --> PUB{"push to main?"}
+    PUB -->|"yes"| GHCR["Publish to GHCR\n:<sha> + :latest"]
+    PUB -->|"no (PR)"| DONE["done"]
+    GHCR --> DONE
+    Dependabot -. weekly .-> PUSH
+```
+
+The scan gate is real: during development it caught **CVE-2026-59901** (netty-codec bzip2) and Alpine base-image CVEs — fixed by a netty pin + `apk upgrade` in the Dockerfile. Today the image scans at 0 HIGH/CRITICAL.
+
+---
 
 ## Features
 
-- Five algorithms: Fixed Window, Sliding Window Log, Sliding Window Counter, Token Bucket, Leaky Bucket — see [Algorithms](#algorithms) for the exact semantics.
-- Configurable limits and windows per algorithm via `application.yml` or environment variables.
-- **Resilient to Redis outages**: circuit breaker + 500 ms command timeout + fail-open (never 500s), with dedicated failure metrics.
-- Optional API-key authentication (`X-Api-Key` header); published Docker config fails closed, see [Authentication](#authentication).
-- Micrometer metrics with a Prometheus exporter.
-- TLS profiles (`dev`/`prod`) using an embedded PKCS12 keystore; recommended edge TLS via Caddy (verified working).
-- Swagger UI at `/swagger-ui.html`.
-- Docker Compose bringing up the app + Redis with healthchecks (optional Redis AUTH password).
-- Redis **AOF persistence** (everysec) + data volumes on master and replica — state survives restarts and failover.
-- Horizontal scaling: stateless app replicas sharing Redis state, Caddy load balancing, Prometheus DNS discovery per replica (all verified live).
-- Testcontainers-based integration tests, including a Redis-down fail-open test (require a running Docker daemon).
-- GitHub Actions CI: full `mvn clean verify` (tests included) + Docker image build + **Trivy vulnerability scan + CycloneDX SBOM**.
-- Operations runbook: [`RUNBOOK.md`](RUNBOOK.md) — per-alert procedures, failover drill, backup/restore, scaling, upgrades.
-
-## Build & Run
-
-Requires Java 21 and Maven. Redis is needed at runtime — either a local one (`SPRING_DATA_REDIS_HOST`/`SPRING_DATA_REDIS_PORT`) or the compose container.
-
-### Maven
-
-```bash
-mvn clean package              # builds the jar (skips tests)
-java -jar target/rate-limiter-service-0.0.1-SNAPSHOT.jar
-# reachable at http://localhost:8080, Redis at localhost:6379
-```
-
-Run the full test suite (starts Redis via Testcontainers, so Docker must be running):
-
-```bash
-mvn clean verify
-```
-
-### Docker Compose
-
-```bash
-cp .env.example .env           # then set a strong RATELIMITER_API_KEY
-docker compose up --build      # starts the app (8080) and a Redis container
-```
-
-The app refuses to start under compose unless `RATELIMITER_API_KEY` is set — this is deliberate, see [Authentication](#authentication). Optionally set `REDIS_PASSWORD` in `.env` to start Redis with `--requirepass` (the app authenticates automatically).
-
-For the high-availability Redis topology (master + replica + Sentinel) and the observability stack, always pass the **full compose file set** so Compose reconciles every container:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.redis-ha.yml -f docker-compose.monitoring.yml up -d --build
-```
-
-For a **production Sentinel quorum** (3 sentinels, quorum 2 — failover decided by a majority, not one process) add `docker-compose.sentinel-ha.yml`. The app learns all three sentinel nodes, so losing any one never breaks topology discovery:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.redis-ha.yml \
-  -f docker-compose.sentinel-ha.yml -f docker-compose.monitoring.yml up -d
-```
-
-### TLS (dev / prod profiles)
-
-**Recommended: terminate TLS at the edge proxy** (the app stays plain HTTP on the internal network):
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.redis-ha.yml \
-  -f docker-compose.monitoring.yml -f docker-compose.tls.yml up -d --build --scale app=2
-# https://localhost (Caddy issues an internal cert; for a real domain set
-# TLS_DOMAIN in .env and remove `tls internal` from caddy/Caddyfile for
-# automatic Let's Encrypt certificates)
-```
-
-The TLS overlay is load-tested (see [Load testing](#load-testing)) and fails over: HTTPS serves through Caddy, the app publishes **no host port** in this mode (edge-only exposure), and Caddy round-robins between scaled replicas (kill a replica and traffic continues on the survivor). In TLS mode the app is NOT reachable on `http://localhost:8080` — use `https://localhost`.
-
-Alternatively the app can serve TLS itself via the `dev`/`prod` profiles, using `src/main/resources/keystore.p12`. It is checked in for development convenience only — regenerate it for any real deployment and keep the password in a secret store:
-
-```bash
-keytool -genkeypair -alias ratelimiter -keyalg RSA -keysize 2048 -validity 3650 \
-  -storetype PKCS12 -keystore src/main/resources/keystore.p12 \
-  -storepass changeit -keypass changeit \
-  -dname "CN=localhost, OU=Rate Limiter, O=Example, C=US"
-```
-
-```bash
-java -jar target/rate-limiter-service-0.0.1-SNAPSHOT.jar --spring.profiles.active=dev
-# HTTPS on port 8080 (keystore password `changeit`)
-```
-
-The `prod` profile refuses to start without `KEYSTORE_PASSWORD` (no fallback) — inject it from your secret store (Docker secrets / K8s secret / vault), never from the repo. Health details are hidden in `prod` and only `health,metrics,prometheus` are exposed.
-
-## Authentication
-
-Auth is optional at the application level and controlled by `ratelimiter.apiKey` (env: `RATELIMITER_API_KEY`):
-
-- **Empty / unset** — open access. Every request on `/api/v1/**` is authenticated as a generic API client.
-- **Set** — every request to `/api/v1/**` must send the value in the `X-Api-Key` header; otherwise a 401 `{"error":"Invalid API key"}` is returned. Invalid attempts increment the `ratelimiter_auth_invalid_api_key_total` counter.
-
-Actuator health/prometheus endpoints and Swagger remain public in both modes.
-
-> **Compose default (fail-closed):** `docker-compose.yml` requires `RATELIMITER_API_KEY` from your environment (`.env`) and errors out if it is missing, so a fresh clone can never silently run with authentication disabled. Run `openssl rand -hex 32` to generate a key. Local Maven runs remain open by default (`apiKey: ''` in `application.yml`).
-
-## API
-
-### Check rate limit
-
-`POST /api/v1/check`
-
-```json
-{
-  "clientId": "user123",
-  "algorithm": "FIXED"
-}
-```
-
-`clientId` is required; `algorithm` is one of `FIXED`, `SLIDING_LOG`, `SLIDING_COUNTER`, `TOKEN_BUCKET`, `LEAKY_BUCKET` (case-insensitive).
-
-
-```json
-{ "allowed": true, "message": "Request allowed" }
-```
-
-**429 – rejected** (plus the same rate-limit headers as a 200)
-
-```json
-{ "allowed": false, "message": "Rate limit exceeded for client user123" }
-```
-
-**400** – missing/invalid `clientId` or `algorithm`, or an unknown algorithm name.
-
-Response headers on both 200 and 429:
-
-- `X-RateLimit-Limit` – configured limit for the algorithm.
-- `X-RateLimit-Remaining` – remaining requests in the current window (200 only; estimated for `SLIDING_COUNTER`, drained water for `LEAKY_BUCKET`).
-- `Retry-After` – seconds until the window resets (429 only).
-- `X-Request-Id` – unique correlation id generated per request.
+- **Five production algorithms** with exact semantics — see [Algorithms](#algorithms).
+- **Atomic distributed state** in Redis Lua scripts (no `INCR`-without-`EXPIRE` races).
+- **Fail-open circuit breaker** (Resilience4j) + 500 ms Redis command timeout — the limiter never 500s the API.
+- **HA Redis topology**: master + replica + **3-sentinel quorum (quorum 2)**, automatic failover, AOF persistence (everysec) + named data volumes on both nodes — state survives restarts *and* failover.
+- **Horizontal scaling**: stateless replicas, Caddy round-robin LB, Prometheus DNS discovery per replica, per-replica log labels in Loki — all verified live.
+- **Optional API-key auth** (`X-Api-Key`) with fail-closed Docker config (compose refuses to start without a key).
+- **TLS everywhere**: edge TLS via Caddy (auto Let's Encrypt) or embedded-keystore profiles (`dev`/`prod`); optional TLS to Redis (`REDIS_SSL=true`).
+- **Full observability**: Prometheus metrics + 6 alert rules, Alertmanager routing with inhibit rules, Loki + promtail JSON structured logs, auto-provisioned Grafana dashboard.
+- **Security-gated CI**: tests → build → Trivy scan → CycloneDX SBOM → GHCR publish; Dependabot weekly.
+- **Operations runbook**: [`RUNBOOK.md`](RUNBOOK.md) — per-alert procedures, failover drill, backup/restore, scaling, upgrades.
+- **Swagger UI** at `/swagger-ui.html`.
 
 ## Algorithms
 
-All state transitions run atomically in Redis Lua scripts; no `INCR`-without-`EXPIRE` races.
+All state transitions are atomic Redis Lua scripts.
 
 | Algorithm | Exact? | Semantics |
 |---|---|---|
 | `FIXED` | yes | Per-client counter, atomic `INCR`+`EXPIRE`; resets at each window boundary. |
-| `SLIDING_LOG` | yes | Redis sorted set of request timestamps; expired entries are trimmed, then the window count is checked and the request appended — all in one script. |
-| `SLIDING_COUNTER` | approximate | Weights the previous window's counter by how much of the current window has elapsed: `estimated = prevCount × (1 − elapsed/window) + currentCount`. |
-| `TOKEN_BUCKET` | yes | Bucket holds up to `limit` tokens and refills by the full capacity each window (lazy refill on access); a request consumes one token. |
-| `LEAKY_BUCKET` | yes | **Water-level model (not a queue):** water leaks out of the bucket at one unit per window, and a request is only allowed while `water < capacity`. When the bucket is full, requests are rejected until a leak period elapses. |
+| `SLIDING_LOG` | yes | Redis sorted set of request timestamps; expired entries trimmed, window count checked, request appended — all in one script. |
+| `SLIDING_COUNTER` | approximate | Weights the previous window's counter by elapsed time: `estimated = prevCount × (1 − elapsed/window) + currentCount`. |
+| `TOKEN_BUCKET` | yes | Bucket holds up to `limit` tokens, refills by full capacity per window (lazy refill on access); a request consumes one token. |
+| `LEAKY_BUCKET` | yes | **Water-level model (not a queue):** water leaks at one unit per window; a request is allowed only while `water < capacity`. Rejection is immediate when full — no waiting queue. |
 
-Note the leaky-bucket rewrite: it tracks how much in-flight "water" has drained over time rather than buffering a FIFO queue of requests — rejection happens immediately when the bucket is full, there is no waiting queue.
+## Technology stack
 
-## Resilience
+| Layer | Choice |
+|---|---|
+| Language / framework | Java 21, Spring Boot 3.5 (supported line; Boot 4 migration deferred) |
+| Redis client | Spring Data Redis / Lettuce, atomic Lua scripts |
+| Resilience | Resilience4j 2.4 circuit breaker (RedisGuard) |
+| Metrics | Micrometer + Prometheus (`/actuator/prometheus`) |
+| Data store | Redis 7 (master + replica + 3 Sentinels, AOF everysec) |
+| Edge / TLS | Caddy 2 (auto HTTPS, round-robin LB) |
+| Observability | Prometheus, Alertmanager, Grafana (auto-provisioned dashboard), Loki + promtail |
+| Logging | Logback structured JSON with `X-Request-Id` correlation |
+| Testing | JUnit 5, Testcontainers (34 tests incl. Redis-down fail-open + concurrency tests) |
+| CI/CD | GitHub Actions, Trivy (0.73.0), CycloneDX SBOM, GHCR |
 
-The rate limiter must not become a hard dependency of your API. Every Redis operation is guarded by a `RedisGuard` (Resilience4j circuit breaker + the 500 ms Lettuce command timeout from `spring.data.redis.timeout`):
+## High-level design decisions
 
-- **Circuit open / Redis down / command timeout** → the limiter **fails open**: the request is allowed and logged, the breaker records the failure, and `ratelimiter.redis.fallback` is incremented. The API stays up during a Redis outage instead of returning 500s.
-- **Recovery** — after `waitDurationInOpenState` (default 30 s) the breaker probes Redis in half-open state and closes again once calls succeed.
-- **Tunable** via the `resilience4j.circuitbreaker.instances.redis.*` block in `application.yml` (sliding window size, failure-rate threshold, open-state duration).
-- Alert on `ratelimiter_redis_fallback_total` (or the breaker's own `resilience4j_circuitbreaker_*` metrics) to detect limiter degradation.
+1. **Redis is the single source of truth** — replicas are stateless, so scaling is just `--scale app=N`. All limit transitions are atomic Lua scripts, safe under any concurrency.
+2. **Fail-open, not fail-closed** — when Redis is down the limiter lets traffic through and *alerts* instead of 500-ing everything. Availability over strictness; documented trade-off, and the outage is visible via `ratelimiter_redis_fallback_total` + the breaker state. Fail-closed is a one-line change if your policy differs.
+3. **Sentinels monitor the master by static IP** — hostname monitoring breaks failover because a stopped container's DNS name disappears. This applies to real infra too: monitor by IP or a stable VIP, never a name that goes away with the node.
+4. **TLS at the edge, not in the app** — Caddy terminates HTTPS; the app stays plain HTTP on the internal network and publishes no host port in TLS mode (edge-only exposure).
+5. **Fail-closed configuration** — `RATELIMITER_API_KEY` and `GRAFANA_ADMIN_USER/PASSWORD` are *required* by compose; a fresh clone can never silently run unauthenticated or with `admin/admin`.
+6. **Security gates in CI, not after** — Trivy blocks HIGH/CRITICAL merges; the SBOM is generated from the *image* (an `fs` SBOM hit Maven Central rate limits) and uploaded as an artifact.
+7. **Observability is loopback-only** — Prometheus/Alertmanager/Loki/Grafana bind to `127.0.0.1`; Grafana requires real credentials; Alertmanager routes criticals immediately (10 s group_wait, 1 h repeat) with an inhibit rule so `RedisFailingOpen` is silenced while `RedisCircuitBreakerOpen` is active.
 
-> **Trade-off:** fail-open means clients can exceed their limit while Redis is down. That is the deliberate choice — availability over strict rate limiting. If you need fail-closed instead, treat a `null` guard result in the limiters as "reject".
+## API
+
+### `POST /api/v1/check`
+
+```json
+{ "clientId": "user123", "algorithm": "FIXED" }
+```
+
+`clientId` is required; `algorithm` is one of `FIXED`, `SLIDING_LOG`, `SLIDING_COUNTER`, `TOKEN_BUCKET`, `LEAKY_BUCKET` (case-insensitive).
+
+**200 – allowed**
+```json
+{ "allowed": true, "message": "Request allowed" }
+```
+
+**429 – rejected** (same rate-limit headers as 200)
+```json
+{ "allowed": false, "message": "Rate limit exceeded for client user123" }
+```
+
+**400** – missing/invalid `clientId` or `algorithm`, or unknown algorithm.
+**401** – missing/wrong `X-Api-Key` (when `RATELIMITER_API_KEY` is set): `{"error":"Invalid API key"}`.
+
+Response headers on both 200 and 429:
+
+- `X-RateLimit-Limit` — configured limit for the algorithm
+- `X-RateLimit-Remaining` — remaining in the current window (200 only; estimated for `SLIDING_COUNTER`, drained water for `LEAKY_BUCKET`)
+- `Retry-After` — seconds until window reset (429 only)
+- `X-Request-Id` — per-request correlation id (also in the logs)
+
+Other endpoints: `/actuator/health`, `/actuator/prometheus`, `/v3/api-docs`, `/swagger-ui.html`.
 
 ## Configuration
 
-Base config in `src/main/resources/application.yml` (profile overrides in `application-dev.yml` / `application-prod.yml`):
+Base config in `src/main/resources/application.yml`:
 
 ```yaml
 spring:
@@ -182,55 +266,59 @@ ratelimiter:
     default: 60s        # per-algorithm overrides, e.g. SLIDING_LOG: PT2M
 ```
 
-> **Gotcha:** durations must use ISO-8601/Spring units (`60s`, `PT1M`, `2h`). A bare number (`60`) is interpreted as **milliseconds**, not seconds.
+> **Gotcha:** durations must use ISO-8601/Spring units (`60s`, `PT1M`, `2h`). A bare number (`60`) is interpreted as **milliseconds**.
 
-Available environment variable overrides:
-
-| Variable | Meaning |
+| Env var | Meaning |
 |---|---|
 | `SPRING_DATA_REDIS_HOST`, `SPRING_DATA_REDIS_PORT` | Redis connection (default `localhost:6379`) |
 | `REDIS_PASSWORD` | Redis AUTH password; blank = no auth |
-| `REDIS_SSL` | `true` to use TLS to Redis |
-| `RATELIMITER_API_KEY` | API key required on `/api/v1/**`; blank = open access |
+| `REDIS_SSL` | `true` = TLS to Redis |
+| `RATELIMITER_API_KEY` | API key required on `/api/v1/**`; blank = open |
 | `RATELIMITER_DEFAULT_LIMIT` | Default per-client limit (prod default 200) |
-| `RATELIMITER_DEFAULT_WINDOW_SEC` | Default window in seconds (prod default 30) |
+| `RATELIMITER_DEFAULT_WINDOW_SEC` | Default window seconds (prod default 30) |
 | `KEYSTORE_PASSWORD` | Keystore password for the `prod` profile |
-| `RECEIVER_URL` | Alertmanager webhook receiver URL (rendered into its config at start) |
-| `GRAFANA_ADMIN_USER`, `GRAFANA_ADMIN_PASSWORD` | Grafana admin credentials (default `admin`/`admin`) |
+| `RECEIVER_URL` | Alertmanager webhook receiver (rendered at container start) |
+| `GRAFANA_ADMIN_USER`, `GRAFANA_ADMIN_PASSWORD` | Grafana credentials — **required**, no default |
 
-### Redis production hardening
+## Docker Compose
 
-- **AUTH/ACL**: set `REDIS_PASSWORD` (or `SPRING_DATA_REDIS_USERNAME`/`SPRING_DATA_REDIS_PASSWORD` for ACL users). Compose applies `--requirepass` automatically when set — on the standalone Redis **and** on the HA replica (`--masterauth`) and Sentinel (`sentinel auth-pass`), so the whole topology authenticates. Verified live: unauthenticated `PING` gets `NOAUTH`, and failover works with auth enabled.
-- **TLS**: `REDIS_SSL=true` (and the standard `SPRING_DATA_REDIS_SSL_*` properties) for encrypted transport.
-- **High availability**: run the Sentinel topology (master + replica + Sentinel) with the additive compose file:
-  ```bash
-  docker compose -f docker-compose.yml -f docker-compose.redis-ha.yml up -d --build
-  ```
-  The app connects via `SPRING_DATA_REDIS_SENTINEL_MASTER`/`SPRING_DATA_REDIS_SENTINEL_NODES`; failover is automatic and was live-tested (killed master → replica promoted in ~15 s → app kept serving, limits kept enforcing, old master rejoined as replica on restart). Sentinel must monitor the master by **static IP or stable VIP, never a hostname** — a stopped container's DNS name disappears and breaks the failover.
-- **State across failover**: with a warm replica (as in this topology), rate-limit state survives failover because the promoted node holds replicated data — limits keep enforcing seamlessly. State resets only if the new primary comes up cold (e.g., full cluster loss). Either way limits re-learn instantly; both behaviors are acceptable, just be aware of which one you get.
-- **Persistence**: AOF is enabled (`--appendonly yes --appendfsync everysec`) on the master and the replica, and both hold named data volumes (`redis-data`, `redis-replica-data`) — state survives container restarts and recreation. Back up regularly (see the [runbook](RUNBOOK.md#backup--restore) for the exact BGSAVE + tar procedure).
-- **Horizontal scaling**: the app is stateless (all state lives in Redis), so replicas scale cleanly:
-  ```bash
-  docker compose -f docker-compose.yml -f docker-compose.redis-ha.yml \
-    -f docker-compose.monitoring.yml -f docker-compose.tls.yml up -d --scale app=2
-  ```
-  Caddy round-robins across replicas (`caddy/Caddyfile`), Prometheus scrapes each replica via DNS discovery, and each appears as its own `container` in Loki. See the [runbook](RUNBOOK.md#scaling).
+Compose files are **additive profiles** — always pass the full set so every container is reconciled:
+
+| Profile | Files | What you get |
+|---|---|---|
+| Base | `docker-compose.yml` | App + standalone Redis (healthchecks, optional AUTH) |
+| HA | `+ docker-compose.redis-ha.yml` | Master + replica + Sentinel, failover |
+| Quorum | `+ docker-compose.sentinel-ha.yml` | 3 sentinels, quorum 2 (production) |
+| Observability | `+ docker-compose.monitoring.yml` | Prometheus, Alertmanager, Loki, promtail, Grafana |
+| TLS edge | `+ docker-compose.tls.yml` | Caddy HTTPS edge (app publishes no host port) |
+
+```bash
+cp .env.example .env          # set RATELIMITER_API_KEY (+ REDIS_PASSWORD, Grafana creds, RECEIVER_URL)
+
+# Production shape (full set):
+docker compose -f docker-compose.yml -f docker-compose.redis-ha.yml \
+  -f docker-compose.sentinel-ha.yml -f docker-compose.monitoring.yml \
+  -f docker-compose.tls.yml up -d --scale app=2
+# → https://localhost (or https://<TLS_DOMAIN>)
+
+# Dev (no edge, app exposed on 8080):
+docker compose -f docker-compose.yml -f docker-compose.redis-ha.yml -f docker-compose.monitoring.yml up -d --build
+```
+
+For a real domain: set `TLS_DOMAIN` in `.env` and remove `tls internal` from `caddy/Caddyfile` — Caddy then obtains and renews Let's Encrypt certificates automatically.
 
 ## Monitoring & Alerting
 
-Run the full observability stack (Prometheus, Alertmanager, Loki, promtail, Grafana) alongside the app:
-
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.redis-ha.yml -f docker-compose.monitoring.yml up -d --build
-# Prometheus:   http://localhost:9090 (alerts at /alerts, targets at /targets)
+# Prometheus:   http://localhost:9090 (alerts /alerts, targets /targets)
 # Alertmanager: http://localhost:9093
-# Grafana:      http://localhost:3000 (admin / GRAFANA_ADMIN_PASSWORD — REQUIRED env, no default)
+# Grafana:      http://localhost:3000 (auto-provisioned "Rate Limiter" dashboard)
 # Loki API:     http://localhost:3100
 ```
 
-All monitoring ports bind to **127.0.0.1 only** (not exposed to the LAN). Grafana fails closed: `docker compose up` errors out unless `GRAFANA_ADMIN_USER`/`GRAFANA_ADMIN_PASSWORD` are set in `.env` (same pattern as the API key).
+All monitoring ports bind to **127.0.0.1 only**. The auto-provisioned dashboard shows request rate per algorithm, throttled (429) rate, throttle ratio, fail-open rate, breaker state, p95/p99 latency, and 5xx rate.
 
-`monitoring/alerts.yml` ships six rules (validated against the live deployment):
+Six alert rules (validated on the live deployment):
 
 | Alert | Condition | Severity |
 |---|---|---|
@@ -241,15 +329,7 @@ All monitoring ports bind to **127.0.0.1 only** (not exposed to the LAN). Grafan
 | `HighApiKeyFailures` | sustained bad API keys (credential stuffing) | warning |
 | `HighLatencyP99` | p99 `http_server_requests_seconds` > 1s for 5m | warning |
 
-- **Logs**: promtail ships every `rate-*` container's stdout to Loki via the Docker socket. Logs are labeled with `container`, `container_id`, `service` (compose service name) and `job="containers"` — e.g. query `{container="rate-app-1"}` in Grafana Explore or at `http://localhost:3100/loki/api/v1/query_range?query=%7Bcontainer%3D%22rate-app-1%22%7D`.
-- **Dashboards**: Grafana auto-provisions a `Rate Limiter` dashboard (`monitoring/grafana/dashboards/rate-limiter.json`): request rate per algorithm, throttled (429) rate, throttle ratio, fail-open rate, breaker state, p95/p99 latency, 5xx rate.
-- **Alertmanager receiver**: `monitoring/alertmanager.yml` is a template whose `__RECEIVER_URL__` placeholder is replaced at container start from the `RECEIVER_URL` environment variable — point it at your Slack/PagerDuty/Opsgenie webhook instead of editing the config:
-  ```bash
-  RECEIVER_URL=https://hooks.slack.com/services/... docker compose ... up -d
-  ```
-  Routing groups by alert/severity/instance, pages criticals immediately (10s, 1h repeat) and adds an inhibit rule so `RedisFailingOpen` is silenced while `RedisCircuitBreakerOpen` is open.
-
-Full operational procedures (alert-by-alert responses, failover drill, backup/restore, scaling, upgrade, incident template) live in [`RUNBOOK.md`](RUNBOOK.md).
+Logs are structured JSON shipped by promtail to Loki, labeled `container` / `service` / `container_id` — query `{container="rate-app-1"}` in Grafana Explore. Full operational procedures live in [`RUNBOOK.md`](RUNBOOK.md).
 
 ## SLOs (defaults)
 
@@ -258,26 +338,14 @@ Full operational procedures (alert-by-alert responses, failover drill, backup/re
 | Availability | 99.9% of `/api/v1/check` calls succeed (non-5xx) | `RateLimiterDown`, `RedisCircuitBreakerOpen` |
 | Latency | p95 < 50 ms, p99 < 1 s | `HighLatencyP99` |
 | Correctness | no 5xx due to limiter failure; fail-open only during Redis outages | `RedisFailingOpen` |
-| Error budget | 429s count toward availability error budget; track `ratelimiter_requests_rejected_total / total` | `HighThrottleRate` |
+| Error budget | 429s count toward the availability budget; track rejected/total | `HighThrottleRate` |
 
 ## Load testing
 
-- **JUnit soak** (excluded from the default run so CI stays fast):
-  ```bash
-  mvn test -Dtest=SoakTest "-Dexcluded.test.groups="
-  # prints e.g. "SOAK: 13027 calls in PT10S (1303 req/s), 0 failures"
-  ```
-- **k6** (for sustained production-scale runs — not bundled, install from k6.io, or use the Docker image):
-  ```bash
-  k6 run --env API_KEY=... --vus 100 --duration 2m loadtest/check.js
-  # or, against the TLS edge from inside the compose network:
-  docker run --rm --network rate_default \
-    -v "$PWD/loadtest:/loadtest" -e API_KEY=... -e BASE_URL=https://localhost \
-    -e K6_INSECURE_SKIP_TLS_VERIFY=true grafana/k6 run /loadtest/check.js
-  ```
-  Fails (exit ≠ 0) if the **5xx rate ≥ 0.1%**, p95 ≥ 100 ms (edge), or checks fail. 429 responses are expected (the limiter doing its job) and are reported separately as `http_429`.
+- **JUnit soak** (excluded from the default run): `mvn test -Dtest=SoakTest "-Dexcluded.test.groups="`
+- **k6** (production-scale runs): `k6 run --env API_KEY=... --vus 100 --duration 2m loadtest/check.js` — fails if 5xx ≥ 0.1%, p95 ≥ 100 ms (edge), or checks fail. 429s are expected (the limiter working) and reported separately as `http_429`.
 
-**Measured on the production shape** (TLS edge → 2 app replicas → 3-sentinel Redis HA, 100 VUs ramping, 2 min):
+**Measured on the production shape** (TLS edge → 2 replicas → 3-sentinel Redis HA, 100 VUs ramping, 2 min):
 
 | Metric | Result |
 |---|---|
@@ -290,49 +358,51 @@ Full operational procedures (alert-by-alert responses, failover drill, backup/re
 
 ## Metrics
 
-Prometheus endpoint: `http://localhost:8080/actuator/prometheus` (also `health`, `info`, `metrics`).
-
-| Metric | Meaning |
-|---|---|
-| `ratelimiter_requests_total` | All requests to `/api/v1/check` |
-| `ratelimiter_requests_allowed` | Requests allowed by the limiter |
-| `ratelimiter_requests_rejected` | Requests rejected (HTTP 429) |
-| `ratelimiter_algorithm_calls_total{algorithm="FIXED"}` | Calls per algorithm |
-| `ratelimiter_auth_invalid_api_key_total` | Requests rejected by API-key auth (401) |
-| `ratelimiter_redis_fallback_total` | Redis calls that failed and were allowed through (fail-open) — **alert on this** |
-| `resilience4j_circuitbreaker_*` | Circuit-breaker state (`state` gauge, calls, failure rate) for the `redis` breaker |
-
-Health details are always shown in the default profile; the `prod` profile hides them.
+`ratelimiter_requests_total` / `_allowed` / `_rejected` (per instance), `ratelimiter_algorithm_calls_total{algorithm="…"}`, `ratelimiter_auth_invalid_api_key_total`, `ratelimiter_redis_fallback_total` (**alert on this**), `resilience4j_circuitbreaker_*` for the `redis` breaker, plus standard `http_server_requests_seconds` histograms (percentiles enabled).
 
 ## Testing
 
 ```bash
-mvn test        # 34 tests: unit + concurrency tests for all 5 algorithms, resilience tests,
-                # Redis-down fail-open test, controller e2e
-mvn verify      # full build including tests (Docker required for Testcontainers)
+mvn test        # 34 tests: unit + concurrency for all 5 algorithms, resilience,
+                # Redis-down fail-open, controller e2e (Testcontainers → Docker required)
+mvn verify      # full build with tests
 ```
 
-## CI
+## CI/CD & release
 
-`.github/workflows/ci.yml` runs on every push/PR:
-
-1. JDK 21 + Maven setup (cached dependencies).
-2. `mvn --batch-mode clean verify` — Testcontainers uses the runner's Docker daemon.
-3. `docker build` to prove the Dockerfile is healthy.
-4. **Trivy scan** of the built image (fails on unfixed HIGH/CRITICAL) — the scan found and blocked CVE-2026-59901 (netty-codec) and base-image Alpine CVEs during development; the Dockerfile now pins the netty fix and runs `apk upgrade` at build time.
-5. **CycloneDX SBOM** generated from the image and uploaded as a CI artifact.
-6. On push to `main`, **publish to GHCR** as `ghcr.io/<owner>/rate-limiter-service:<sha>` + `:latest` (needs the repo's `packages: write` permission, granted automatically to `GITHUB_TOKEN`).
-
-Dependabot (`.github/dependabot.yml`) opens weekly PRs for Maven, GitHub Actions and Docker image updates.
+`.github/workflows/ci.yml` on every push/PR: JDK 21 + Maven (cached) → `mvn clean verify` → `docker build` → **Trivy scan** (fails on unfixed HIGH/CRITICAL) → **CycloneDX SBOM** artifact → on `main`, **publish to GHCR** (`ghcr.io/1046prt/rate-limiter-service:<sha>` + `:latest`). Dependabot opens weekly update PRs; each is CI-gated, so security-breaking updates can't merge silently.
 
 ## Logging
 
-Logback config (`logback-spring.xml`) logs **structured JSON** to the console with MDC context (including the `X-Request-Id` correlation id). Ship it to any JSON log collector as-is.
+Logback writes **structured JSON** with MDC context incl. `X-Request-Id` — ship to any JSON log collector as-is.
 
-## Stack notes
+## Future improvements
 
-- **Spring Boot 3.5.x** (supported line) on Java 21, Spring Data Redis (Lettuce), Resilience4j 2.x, Micrometer, Testcontainers.
-- Boot 4.x is the next major line; the app deliberately pins the current 3.x line — plan a migration when convenient, nothing in this codebase depends on Boot-3-specific internals beyond standard auto-configuration.
+- **Multi-host DR** — a true cross-host Sentinel quorum and replica placement (the current HA is single-host; a host loss is still a total outage).
+- **Kubernetes/Helm deployment** — Deployment/StatefulSet manifests, HPA on the throttle metric, service mesh edge.
+- **Dynamic limit administration** — an admin API/CRUD for limits (no redeploy), quota tiers, burst credits.
+- **Higher-performance callers** — gRPC or binary protocol for very high QPS.
+- **Redis Cluster / partitioning** for multi-region or huge client bases.
+- **OpenTelemetry tracing** across edge → limiter → Redis.
+- **Fail-closed mode** as a config option for stricter deployments.
+- **Boot 4 migration** — nothing in the codebase depends on Boot-3-specific internals.
+
+## Repository layout
+
+```
+├── src/main/java/.../ratelimiter/     # controllers, algorithms, config, resilience
+│   ├── algorithm/                     # 5 limiter implementations (Lua scripts)
+│   ├── config/                        # Redis, metrics, security config
+│   └── resilience/                    # RedisGuard circuit breaker + fail-open
+├── src/test/java/.../                 # 34 tests incl. concurrency + Redis-down
+├── monitoring/                        # Prometheus, Alertmanager, Loki, Grafana, promtail configs
+├── caddy/                             # Caddyfile (TLS edge + LB)
+├── loadtest/                          # k6 scenario
+├── docker-compose*.yml                # additive profiles (base/HA/quorum/monitoring/TLS)
+├── RUNBOOK.md                         # on-call procedures, drills, backup/restore
+├── docs/architecture.md               # deep-dive diagrams
+└── .github/workflows/ci.yml           # build → scan → SBOM → GHCR
+```
 
 ## License
 
