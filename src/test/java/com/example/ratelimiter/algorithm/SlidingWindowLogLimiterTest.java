@@ -10,6 +10,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.data.redis.core.StringRedisTemplate;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -59,5 +60,13 @@ public class SlidingWindowLogLimiterTest {
         long now = System.currentTimeMillis();
         redisTemplate.opsForZSet().removeRangeByScore("slidinglog:" + clientId, 0, now);
         assertTrue(limiter.allow(clientId), "Request after window expiry should be allowed");
+    }
+
+    @Test
+    void remainingReflectsConsumedRequests() {
+        String clientId = "clientD";
+        assertEquals(100, limiter.remaining(clientId), "fresh client starts at the full limit");
+        assertTrue(limiter.allow(clientId));
+        assertEquals(99, limiter.remaining(clientId), "one request consumes one slot");
     }
 }

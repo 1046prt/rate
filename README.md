@@ -1,4 +1,4 @@
-# Rate Limiter Service
+﻿# Rate Limiter Service
 
 **Distributed rate-limiting as a service (RLaaS)** — a Spring Boot microservice that decides, per client, whether a request is allowed or throttled (HTTP 429). Five classic algorithms, **Redis-backed shared state** (atomic Lua scripts — concurrency-safe), a Redis HA topology with Sentinel failover, a TLS edge, and full observability. Hardened for production and load-tested.
 
@@ -144,7 +144,7 @@ Every algorithm's state transition — read, mutate, expire — runs inside **on
 
 ```mermaid
 flowchart LR
-    PUSH["push / pull_request"] --> MVN["mvn clean verify\n34 tests incl. Testcontainers"]
+    PUSH["push / pull_request"] --> MVN["mvn clean verify\n49 tests incl. Testcontainers"]
     MVN --> DOCKER["docker build"]
     DOCKER --> TRIVY{"Trivy scan\nHIGH/CRITICAL?"}
     TRIVY -->|"found"| FAIL["✗ CI fails — merge blocked"]
@@ -198,7 +198,7 @@ All state transitions are atomic Redis Lua scripts.
 | Edge / TLS | Caddy 2 (auto HTTPS, round-robin LB) |
 | Observability | Prometheus, Alertmanager, Grafana (auto-provisioned dashboard), Loki + promtail |
 | Logging | Logback structured JSON with `X-Request-Id` correlation |
-| Testing | JUnit 5, Testcontainers (34 tests incl. Redis-down fail-open + concurrency tests) |
+| Testing | JUnit 5, Testcontainers (49 tests incl. Redis-down fail-open + concurrency tests) |
 | CI/CD | GitHub Actions, Trivy (0.73.0), CycloneDX SBOM, GHCR |
 
 ## High-level design decisions
@@ -213,33 +213,67 @@ All state transitions are atomic Redis Lua scripts.
 
 ## API
 
-### `POST /api/v1/check`
+Interactive docs (with a "Try it out" button): [`/swagger-ui.html`](https://localhost/swagger-ui.html). Raw spec: `/v3/api-docs`. All examples below are copied from the live service.
+
+### Authentication
+
+When `RATELIMITER_API_KEY` is set, every request to `/api/v1/**` must carry it in the `X-Api-Key` header (header names are case-insensitive). With no key configured the API is open. Swagger UI offers "Authorize" for the `X-Api-Key` scheme.
+
+```bash
+curl https://api.example.com/api/v1/check \
+  -H "Content-Type: application/json" \
+  -H "X-Api-Key: your-api-key"
+```
+
+### Request body
+
+`clientId` is required; `algorithm` is one of `FIXED`, `SLIDING_LOG`, `SLIDING_COUNTER`, `TOKEN_BUCKET`, `LEAKY_BUCKET` (case-insensitive).
 
 ```json
 { "clientId": "user123", "algorithm": "FIXED" }
 ```
 
-`clientId` is required; `algorithm` is one of `FIXED`, `SLIDING_LOG`, `SLIDING_COUNTER`, `TOKEN_BUCKET`, `LEAKY_BUCKET` (case-insensitive).
+### Response body
 
 **200 – allowed**
 ```json
 { "allowed": true, "message": "Request allowed" }
 ```
 
-**429 – rejected** (same rate-limit headers as 200)
+**429 – rejected**
 ```json
 { "allowed": false, "message": "Rate limit exceeded for client user123" }
 ```
 
-**400** – missing/invalid `clientId` or `algorithm`, or unknown algorithm.
-**401** – missing/wrong `X-Api-Key` (when `RATELIMITER_API_KEY` is set): `{"error":"Invalid API key"}`.
+### Error responses
 
-Response headers on both 200 and 429:
+| Code | Meaning | Body |
+|---|---|---|
+| `400` | Missing/invalid `clientId` or `algorithm`, unknown algorithm, or malformed JSON | `{"message":"clientId: must not be blank"}` / `{"message":"Malformed request body"}` |
+| `401` | Missing/wrong `X-Api-Key` (when a key is configured) | `{"error":"Invalid API key"}` |
+| `500` | Unexpected error | `{"message":"Internal server error"}` |
+
+### Rate-limit behavior
+
+Both 200 and 429 carry rate-limit headers, so clients can self-throttle without parsing bodies:
 
 - `X-RateLimit-Limit` — configured limit for the algorithm
 - `X-RateLimit-Remaining` — remaining in the current window (200 only; estimated for `SLIDING_COUNTER`, drained water for `LEAKY_BUCKET`)
 - `Retry-After` — seconds until window reset (429 only)
 - `X-Request-Id` — per-request correlation id (also in the logs)
+
+Example conversation (limit 100/60 s):
+
+```text
+→ POST /api/v1/check  {"clientId":"user123","algorithm":"FIXED"}
+← 200 {"allowed":true,"message":"Request allowed"}
+  X-RateLimit-Limit: 100   X-RateLimit-Remaining: 99   X-Request-Id: 8f3c…
+   …98 more allowed requests…
+← 429 {"allowed":false,"message":"Rate limit exceeded for client user123"}
+  X-RateLimit-Limit: 100   Retry-After: 37   X-Request-Id: b1e9…
+```
+
+State is shared across replicas (Redis), so the same limits hold no matter which replica answers.
 
 Other endpoints: `/actuator/health`, `/actuator/prometheus`, `/v3/api-docs`, `/swagger-ui.html`.
 
@@ -363,10 +397,20 @@ Logs are structured JSON shipped by promtail to Loki, labeled `container` / `ser
 ## Testing
 
 ```bash
-mvn test        # 34 tests: unit + concurrency for all 5 algorithms, resilience,
-                # Redis-down fail-open, controller e2e (Testcontainers → Docker required)
-mvn verify      # full build with tests
+mvn test        # 49 tests; Testcontainers requires Docker
+mvn verify      # full build with tests + JaCoCo coverage report (target/site/jacoco/)
 ```
+
+**Coverage: 91.3% lines / 92.2% instructions / 69.4% branches** (JaCoCo, `mvn verify`).
+
+| Layer | Tests |
+|---|---|
+| Algorithms (all 5) | unit + Testcontainers integration: within limit, beyond limit, window expiry, `remaining()` |
+| Concurrency (all 5) | parallel requests never race (atomic Lua scripts) |
+| Redis outage | fail-open: requests allowed + full limit reported while Redis is down (FIXED + SLIDING_COUNTER) |
+| Circuit breaker | success pass-through, failure → fail-open, open circuit short-circuits (Redis not invoked), half-open recovery |
+| Security | `ApiKeyAuthFilter` unit tests (valid/missing/wrong key, open access, non-API paths) + e2e 401 through the real filter chain |
+| REST e2e | real Redis + real security chain: 200 + rate-limit headers, 429 + Retry-After, 400 (validation, unknown algorithm, malformed JSON), 401, client isolation |
 
 ## CI/CD & release
 
@@ -394,7 +438,7 @@ Logback writes **structured JSON** with MDC context incl. `X-Request-Id` — shi
 │   ├── algorithm/                     # 5 limiter implementations (Lua scripts)
 │   ├── config/                        # Redis, metrics, security config
 │   └── resilience/                    # RedisGuard circuit breaker + fail-open
-├── src/test/java/.../                 # 34 tests incl. concurrency + Redis-down
+├── src/test/java/.../                 # 49 tests incl. concurrency + Redis-down
 ├── monitoring/                        # Prometheus, Alertmanager, Loki, Grafana, promtail configs
 ├── caddy/                             # Caddyfile (TLS edge + LB)
 ├── loadtest/                          # k6 scenario

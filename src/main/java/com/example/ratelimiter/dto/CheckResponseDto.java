@@ -1,10 +1,15 @@
 package com.example.ratelimiter.dto;
 
+import io.swagger.v3.oas.annotations.media.Schema;
+
 /**
  * Response payload for rate‑limit check.
  */
 public class CheckResponseDto {
+    @Schema(description = "true when the request is allowed, false when throttled", example = "true")
     private boolean allowed;
+
+    @Schema(description = "Human-readable decision", example = "Request allowed")
     private String message;
 
     public CheckResponseDto() {}

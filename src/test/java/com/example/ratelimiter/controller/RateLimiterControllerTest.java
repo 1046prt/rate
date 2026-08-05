@@ -22,10 +22,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * End-to-end REST tests covering the full request flow: authentication, rate-limit
  * decision, rate-limit response headers, 429 with Retry-After, and validation errors.
+ * Runs against a real Redis container (Testcontainers) and the real security filter chain.
  */
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+        properties = "ratelimiter.api-key=test-api-key")
 @Import(TestRedisConfig.class)
 public class RateLimiterControllerTest {
+
+    private static final String API_KEY = "test-api-key";
 
     @Autowired
     private TestRestTemplate restTemplate;
@@ -85,15 +89,30 @@ public class RateLimiterControllerTest {
     void rejectsMalformedJsonWith400() {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.set("X-Api-Key", API_KEY);
         HttpEntity<String> malformed = new HttpEntity<>("{invalid json", headers);
         ResponseEntity<CheckResponseDto> response =
                 restTemplate.postForEntity("/api/v1/check", malformed, CheckResponseDto.class);
         assertEquals(HttpStatus.BAD_REQUEST, response.getStatusCode());
     }
 
+    @Test
+    void rejectsMissingApiKeyWith401() {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        CheckRequestDto body = new CheckRequestDto();
+        body.setClientId("user401");
+        body.setAlgorithm("FIXED");
+        HttpEntity<CheckRequestDto> noKey = new HttpEntity<>(body, headers);
+        ResponseEntity<String> response = restTemplate.postForEntity("/api/v1/check", noKey, String.class);
+        assertEquals(HttpStatus.UNAUTHORIZED, response.getStatusCode());
+        assertTrue(response.getBody().contains("Invalid API key"));
+    }
+
     private ResponseEntity<CheckResponseDto> post(String clientId, String algorithm) {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.set("X-Api-Key", API_KEY);
         CheckRequestDto body = new CheckRequestDto();
         body.setClientId(clientId);
         body.setAlgorithm(algorithm);
