@@ -53,6 +53,20 @@ services:
       - ./monitoring/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
     restart: unless-stopped
 
+  # Host-side metrics from the backups/ dir: exports redis-backup.prom (written
+  # by the redis-backup sidecar) via the textfile collector so Prometheus can
+  # alert when backups go stale (RedisBackupStale). Default collectors are
+  # disabled - no host filesystem access needed.
+  node-exporter:
+    image: quay.io/prometheus/node-exporter:v1.8.2
+    command:
+      - --collector.disable-defaults
+      - --collector.textfile
+      - --collector.textfile.directory=/textfile
+    volumes:
+      - ./backups:/textfile:ro
+    restart: unless-stopped
+
   grafana:
     image: grafana/grafana:11.3.0
     environment:

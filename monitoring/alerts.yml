@@ -25,6 +25,17 @@ groups:
         annotations:
           summary: "Redis calls are failing - rate limiter is failing open"
 
+      - alert: RedisBackupStale
+        expr: |
+          (time() - redis_backup_success_timestamp_seconds > 129600)
+          or absent(redis_backup_success_timestamp_seconds)
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No successful Redis backup in the last 36 hours"
+          description: "The redis-backup sidecar last reported success {{ $value | humanizeDuration }} ago. Check docker ps / docker logs rate-redis-backup-1."
+
   - name: rate-limiter-errors
     rules:
       - alert: HighThrottleRate
@@ -56,3 +67,50 @@ groups:
           severity: warning
         annotations:
           summary: "p99 latency exceeds 1s"
+
+  # SLO: 99.9% availability (0.1% error budget), 30-day window. Recording rules
+  # feed the error-budget dashboard (Grafana "SLO Error Budget") and the burn
+  # alerts below (Google SRE multi-window guidance: burn-rate thresholds are
+  # derived from error_budget = 0.1% and a 30-day budget period).
+  - name: rate-limiter-slo
+    rules:
+      - record: rate_limiter:requests:rate5m
+        expr: sum(rate(http_server_requests_seconds_count[5m]))
+      - record: rate_limiter:errors5xx:rate5m
+        expr: sum(rate(http_server_requests_seconds_count{status=~"5.."}[5m]))
+      - record: rate_limiter:requests:total30d
+        expr: sum(increase(http_server_requests_seconds_count[30d]))
+      - record: rate_limiter:errors5xx:total30d
+        expr: sum(increase(http_server_requests_seconds_count{status=~"5.."}[30d]))
+      - record: rate_limiter:error_ratio:5m
+        expr: rate_limiter:errors5xx:rate5m / rate_limiter:requests:rate5m
+      - record: rate_limiter:error_ratio:30d
+        expr: rate_limiter:errors5xx:total30d / rate_limiter:requests:total30d
+      - record: rate_limiter:burn_rate:5m
+        expr: rate_limiter:error_ratio:5m / 0.001
+
+  - name: rate-limiter-slo-budget
+    rules:
+      - alert: SloErrorBudgetBurnFast
+        expr: rate_limiter:burn_rate:5m > 14.4
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Error budget burning fast - sustained >14.4x burn rate (99.9% budget would last ~2 days)"
+
+      - alert: SloErrorBudgetBurnSlow
+        expr: rate_limiter:burn_rate:5m > 6
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Error budget burning - sustained >6x burn rate (99.9% budget would last ~5 days)"
+
+      - alert: SloErrorBudgetExhausted
+        expr: rate_limiter:error_ratio:30d > 0.001
+        for: 1h
+        labels:
+          severity: critical
+        annotations:
+          summary: "30-day error rate exceeds the 99.9% SLO - error budget exhausted"

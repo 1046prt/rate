@@ -6,10 +6,9 @@ Operational procedures for the Rate Limiter stack. Alerts are fired by Prometheu
 ## On-call quickstart
 
 1. Read the alert: which service, which instance, since when (`monitoring/alerts.yml`).
-2. Check the dashboards (Grafana `Rate Limiter`, `http://localhost:3000`):
-   - request rate / throttle ratio → is the limiter misconfigured or being hammered?
-   - fail-open rate (`ratelimiter_redis_fallback_total`) → Redis problem?
-   - breaker state, latency p95/p99, 5xx rate.
+2. Check the dashboards (Grafana, `http://localhost:3000`): "Rate Limiter" for
+   traffic/latency/fail-open/breaker; "SLO Error Budget" for error ratio, burn
+   rate, backup freshness.
 3. Check logs: `{container="rate-app-1"}` in Loki Explore (`http://localhost:3100`).
 4. Apply the relevant procedure below. Never "fix" by restarting blindly — read first.
 
@@ -70,12 +69,31 @@ p99 of `http_server_requests_seconds` > 1s for 5m.
 - Check replica failover state; check app GC: `actuator/metrics/jvm.gc.pause`?
 - Check load: `k6 run --env API_KEY=... --vus 100 --duration 2m loadtest/check.js`.
 
+### RedisBackupStale (critical)
+No successful Redis backup in 36h (or the freshness metric is absent).
+
+- `docker ps` → is the `redis-backup` container healthy? If unhealthy, the
+  `.prom` freshness file is missing or stale: `docker logs rate-redis-backup-1`.
+- Check the archive: `ls -l backups/` (host dir) — expect `redis-YYYYMMDD-HHMMSS.tgz`.
+- Manual one-shot backup (diagnosis): `docker exec rate-redis-backup-1 redis-cli -a <pass> -h redis BGSAVE` then `tar` the archive by hand (see Backup & restore).
+- If node-exporter/prometheus broke, the alert also fires — verify the scrape target `node-exporter:9100` is up.
+
+### SloErrorBudgetBurnFast / BurnSlow / Exhausted
+Error-budget alerts (99.9% target, 0.1% budget, 30-day window). Fast burn = >14.4x
+for 15m; slow burn = >6x for 1h; exhausted = 30-day error ratio > 0.1%.
+
+- Traffic is erroring, not throttling: check `http_server_requests_seconds_count{status=~"5.."}`
+  per app instance; Loki for 5xx stack traces.
+- A missing metric (no traffic yet) means no alert — these fire on real error rates only.
+- Exhausted = budget consumed for the month: postmortem required, fix the 5xx
+  source (typically a regression in the app or a Redis fail-open storm).
+
 ## Redis failover drill (HA topology)
 
 1. Warm up a client key, confirm it is limited: 100 calls allowed, then 429.
 2. `docker stop rate-limiter-redis`.
 3. Watch: `docker exec rate-sentinel-1 redis-cli -p 26379 sentinel get-master-addr-by-name mymaster`
-   → the replica (`172.28.0.3`) becomes master within ~15s.
+   → the replica becomes master within ~15s.
 4. Verify: app still serves 200 for new clients, the pre-failover client still 429
    (state survives with a warm replica + AOF).
 5. `docker start rate-limiter-redis` → it rejoins as a replica (`role: slave`).
@@ -86,7 +104,13 @@ p99 of `http_server_requests_seconds` > 1s for 5m.
 State = Redis data (rate-limit windows). AOF (`--appendonly yes --appendfsync everysec`)
 and RDB are on the `redis-data` / `redis-replica-data` volumes.
 
-Backup (scheduled, e.g. nightly cron on the host):
+**Automatic (default):** the `redis-backup` sidecar (compose service in
+`docker-compose.redis-ha.yml`) runs BGSAVE + tar every 24h into the host
+`./backups` dir, keeps `BACKUP_KEEP` archives (default 7), and writes
+`redis-backup.prom` (freshness metric scraped by node-exporter → `RedisBackupStale`
+alert). Logs: `docker logs rate-redis-backup-1`.
+
+**Manual one-shot:**
 
 ```bash
 docker exec rate-limiter-redis redis-cli -a "$REDIS_PASSWORD" BGSAVE

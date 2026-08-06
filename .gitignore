@@ -7,6 +7,19 @@ sbom.cdx.json
 .idea/
 .vscode/
 *.iml
+.run/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# JVM crash dumps
+hs_err_pid*
+replay_pid*
+
+# Runtime backup artifacts - produced on the host by the redis-backup sidecar
+# (monitoring/backup-entrypoint.sh). Content is re-creatable; see RUNBOOK.
+backups/
 
 # Local infra state (Caddy/Redis data dirs, if any)
 caddy/data/

@@ -350,18 +350,24 @@ For a real domain: set `TLS_DOMAIN` in `.env` and remove `tls internal` from `ca
 # Loki API:     http://localhost:3100
 ```
 
-All monitoring ports bind to **127.0.0.1 only**. The auto-provisioned dashboard shows request rate per algorithm, throttled (429) rate, throttle ratio, fail-open rate, breaker state, p95/p99 latency, and 5xx rate.
+All monitoring ports bind to **127.0.0.1 only**. Auto-provisioned dashboards: "Rate Limiter" (request rate per algorithm, throttled rate, throttle ratio, fail-open rate, breaker state, p95/p99 latency, 5xx rate) and "SLO Error Budget" (5m and 30d error ratio, burn rate, last Redis backup age, request/5xx volume). Backups run automatically every 24h via the `redis-backup` sidecar (BGSAVE + tar, `BACKUP_KEEP` archives in `./backups`), publishing a freshness metric so failures page as `RedisBackupStale`.
 
-Six alert rules (validated on the live deployment):
+Ten alert rules (validated on the live deployment):
 
 | Alert | Condition | Severity |
 |---|---|---|
 | `RateLimiterDown` | `up == 0` for 1m | critical |
 | `RedisCircuitBreakerOpen` | breaker `redis` open for 1m | critical |
 | `RedisFailingOpen` | `ratelimiter_redis_fallback_total` increasing | warning |
+| `RedisBackupStale` | no successful backup in 36h (or metric absent) | critical |
 | `HighThrottleRate` | >50% of requests are 429 for 5m | warning |
 | `HighApiKeyFailures` | sustained bad API keys (credential stuffing) | warning |
 | `HighLatencyP99` | p99 `http_server_requests_seconds` > 1s for 5m | warning |
+| `SloErrorBudgetBurnFast` | >14.4x burn rate for 15m (99.9% budget ~2 days) | critical |
+| `SloErrorBudgetBurnSlow` | >6x burn rate for 1h (99.9% budget ~5 days) | warning |
+| `SloErrorBudgetExhausted` | 30-day error ratio > 0.1% | critical |
+
+Alerts are routed by Alertmanager to the `RECEIVER_URL` webhook (set it in `.env`; see the placeholder in `.env.example`).
 
 Logs are structured JSON shipped by promtail to Loki, labeled `container` / `service` / `container_id` — query `{container="rate-app-1"}` in Grafana Explore. Full operational procedures live in [`RUNBOOK.md`](RUNBOOK.md).
 
@@ -369,10 +375,11 @@ Logs are structured JSON shipped by promtail to Loki, labeled `container` / `ser
 
 | SLO | Definition | Backing alert |
 |---|---|---|
-| Availability | 99.9% of `/api/v1/check` calls succeed (non-5xx) | `RateLimiterDown`, `RedisCircuitBreakerOpen` |
+| Availability | 99.9% of `/api/v1/check` calls succeed (non-5xx) | `RateLimiterDown`, `RedisCircuitBreakerOpen`, `SloErrorBudgetBurnFast` / `BurnSlow` / `Exhausted` |
 | Latency | p95 < 50 ms, p99 < 1 s | `HighLatencyP99` |
 | Correctness | no 5xx due to limiter failure; fail-open only during Redis outages | `RedisFailingOpen` |
 | Error budget | 429s count toward the availability budget; track rejected/total | `HighThrottleRate` |
+| Data safety | daily Redis backups exist and are fresh | `RedisBackupStale` |
 
 ## Load testing
 

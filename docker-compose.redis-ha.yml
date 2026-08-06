@@ -66,5 +66,29 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # Scheduled backups: BGSAVE + tar of the redis-data volume every 24h with
+  # rotation, plus a textfile metric consumed by node-exporter so stale/failed
+  # backups trigger the RedisBackupStale alert. Restore: see RUNBOOK.md.
+  redis-backup:
+    image: redis:7-alpine
+    command: ["sh", "/backup-entrypoint.sh"]
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - BACKUP_KEEP=${BACKUP_KEEP:-7}
+    volumes:
+      - redis-data:/data:ro
+      - ./monitoring/backup-entrypoint.sh:/backup-entrypoint.sh:ro
+      - ./backups:/backup
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /backup/redis-backup.prom"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    restart: unless-stopped
+
 volumes:
   redis-replica-data:
